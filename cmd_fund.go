@@ -6,10 +6,12 @@ import (
 
 	"crypto/ed25519"
 
+	"github.com/lunfardo314/proxima-multispam/internal/multispam"
+	"github.com/lunfardo314/proxima/api"
+	"github.com/lunfardo314/proxima/api/client"
 	"github.com/lunfardo314/proxima/ledger"
 	"github.com/lunfardo314/proxima/ledger/base"
 	"github.com/lunfardo314/proxima/ledger/txbuilder"
-	"github.com/lunfardo314/proxima-multispam/internal/multispam"
 	"github.com/lunfardo314/proxima/proxi/glb"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -85,8 +87,16 @@ func runFundCmd(cmd *cobra.Command, _ []string) {
 
 		totalNeeded := amount*uint64(len(batch)) + tagAlongFee
 		walletAccount := ledger.SigLockFromED25519PrivateKey(walletData.PrivateKey)
-		walletOutputs, _, _, err := clnt.GetOutputsForAmount(walletAccount, totalNeeded)
+		res, err := clnt.GetOutputs(walletAccount.ControllerID(), client.GetOutputsParams{
+			LockType:  api.GetOutputsLockTypeSigLock,
+			Chained:   client.NonChainedOnly(),
+			SortBy:    api.GetOutputsSortByAmount,
+			SortOrder: api.GetOutputsSortOrderDesc,
+			ForAmount: totalNeeded,
+		})
 		glb.AssertNoError(err)
+		glb.Assertf(res.AvailableAmount >= totalNeeded, "not enough tokens: have %d, need %d", res.AvailableAmount, totalNeeded)
+		walletOutputs := res.Outputs
 
 		// Build multi-output transaction
 		txb := txbuilder.New()
