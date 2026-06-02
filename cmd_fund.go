@@ -11,7 +11,8 @@ import (
 	"github.com/lunfardo314/proxima/api/client"
 	"github.com/lunfardo314/proxima/ledger"
 	"github.com/lunfardo314/proxima/ledger/base"
-	"github.com/lunfardo314/proxima/ledger/txbuilder"
+	"github.com/lunfardo314/proxima/ledger/transaction"
+	"github.com/lunfardo314/proxima/ledger/txbuildercore"
 	"github.com/lunfardo314/proxima/proxi/glb"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -87,7 +88,7 @@ func runFundCmd(cmd *cobra.Command, _ []string) {
 
 		totalNeeded := amount*uint64(len(batch)) + tagAlongFee
 		walletAccount := ledger.SigLockFromED25519PrivateKey(walletData.PrivateKey)
-		res, err := clnt.GetOutputs(walletAccount.ControllerID(), client.GetOutputsParams{
+		res, err := clnt.GetOutputsForControllerID(walletAccount.ControllerID().Bytes(), client.GetOutputsParams{
 			LockType:  api.GetOutputsLockTypeSigLock,
 			Chained:   client.NonChainedOnly(),
 			SortBy:    api.GetOutputsSortByAmount,
@@ -98,37 +99,39 @@ func runFundCmd(cmd *cobra.Command, _ []string) {
 		glb.Assertf(res.AvailableAmount >= totalNeeded, "not enough tokens: have %d, need %d", res.AvailableAmount, totalNeeded)
 		walletOutputs := res.Outputs
 
-		// Build multi-output transaction
-		txb := txbuilder.New()
-		inTotal, inTs, err := txb.ConsumeOutputsNoUnlock(walletOutputs...)
-		glb.AssertNoError(err)
+		// Build multi-output transaction with the raw bytes-only composer.
+		var inTotal uint64
+		inTs := base.NilLedgerTime
+		for _, o := range walletOutputs {
+			inTotal += o.Output.TokenBalance()
+			inTs = base.MaximumTime(inTs, o.Timestamp())
+		}
 
 		ts := ledger.TimeNow()
 		glb.Assertf(ledger.ValidTransactionPace(inTs, ts), "timestamp pace violation, try again shortly")
 
-		// Set unlock params: signature on input 0, references for rest
-		for i := range walletOutputs {
-			if i == 0 {
-				txb.PutSignatureUnlock(0)
-			} else {
-				_ = txb.PutUnlockReference(byte(i), ledger.ConstraintIndexLock, 0)
-			}
+		txb := txbuildercore.New(ledger.L(ts.Slot).UpgradeIndex())
+
+		// Consume inputs and wire the standard unlock pattern:
+		// input 0 signs, inputs 1..n reference input 0's lock.
+		for _, o := range walletOutputs {
+			txb.ConsumeOutput(o.Output.Bytes(), o.ID)
 		}
+		err = txb.PutStandardInputUnlocks(len(walletOutputs))
+		glb.AssertNoError(err)
 
 		// Produce one output per target
 		for _, t := range batch {
 			out := ledger.NewOutput(func(o *ledger.OutputBuilder) {
 				o.WithTokenBalance(amount).WithLock(t.addr)
 			})
-			_, err = txb.ProduceOutput(out)
-			glb.AssertNoError(err)
+			txb.ProduceOutput(out.Bytes())
 		}
 
 		// Produce tag-along output
 		holderID := base.HolderIDFromPublicKey(base.SignatureTypeED25519, walletData.PrivateKey.Public().(ed25519.PublicKey))
 		tagAlongOut := ledger.NewTagAlongOutput(tagAlongFee, *tagAlongSeqID, holderID)
-		_, err = txb.ProduceOutput(tagAlongOut)
-		glb.AssertNoError(err)
+		txb.ProduceOutput(tagAlongOut.Bytes())
 
 		// Produce remainder if needed
 		spent := amount*uint64(len(batch)) + tagAlongFee
@@ -136,18 +139,30 @@ func runFundCmd(cmd *cobra.Command, _ []string) {
 			remainderOut := ledger.NewOutput(func(o *ledger.OutputBuilder) {
 				o.WithTokenBalance(inTotal - spent).WithLock(walletAccount)
 			})
-			_, err = txb.ProduceOutput(remainderOut)
-			glb.AssertNoError(err)
+			txb.ProduceOutput(remainderOut.Bytes())
 		}
 
-		txb.TransactionData.Timestamp = ts
-		txb.TransactionData.InputCommitment = ledger.HashOutputs(txb.ConsumedOutputs...)
+		// Finalise: timestamp, input commitment, signature.
+		txb.SetTimestamp(ts)
+		txb.ComputeInputCommitment()
 		txb.SignED25519(walletData.PrivateKey)
 
-		txBytes, txid, txString, err := txb.BytesWithValidation()
+		txBytes := txb.Bytes()
+		consumed := txb.ConsumedOutputBytes()
+		tx, err := transaction.ParseAndValidate(txBytes, func(i byte) ([]byte, error) {
+			if int(i) >= len(consumed) {
+				return nil, fmt.Errorf("no consumed output %d", i)
+			}
+			return consumed[i], nil
+		})
 		if err != nil {
-			glb.Fatalf("transaction validation failed: %v\n%s", err, txString)
+			diag := ""
+			if tx != nil {
+				diag = "\n" + tx.String()
+			}
+			glb.Fatalf("transaction validation failed: %v%s", err, diag)
 		}
+		txid := tx.ID()
 
 		err = clnt.SubmitTransaction(txBytes)
 		glb.AssertNoError(err)

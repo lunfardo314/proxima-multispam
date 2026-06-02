@@ -11,7 +11,8 @@ import (
 	"github.com/lunfardo314/proxima/api/client"
 	"github.com/lunfardo314/proxima/ledger"
 	"github.com/lunfardo314/proxima/ledger/base"
-	"github.com/lunfardo314/proxima/ledger/txbuilder"
+	"github.com/lunfardo314/proxima/ledger/transaction"
+	"github.com/lunfardo314/proxima/ledger/txbuildercore"
 )
 
 // spentEntry tracks a UTXO that was consumed by a submitted transaction.
@@ -261,11 +262,13 @@ func (s *Sender) buildAndSubmitBatch(available []*ledger.OutputWithID, pace int,
 // buildOneTx constructs a single transfer transaction.
 // Returns txBytes, txID, remainder output (for chaining), or error.
 func (s *Sender) buildOneTx(inputs []*ledger.OutputWithID, pace int, seqInfo SequencerInfo, includeTagAlong bool) ([]byte, base.TransactionID, *ledger.OutputWithID, error) {
-	txb := txbuilder.New()
-
-	inTotal, inTs, err := txb.ConsumeOutputsNoUnlock(inputs...)
-	if err != nil {
-		return nil, base.TransactionID{}, nil, err
+	// Compute input total and the maximum input timestamp (the raw
+	// txbuildercore composer is bytes-only and does not aggregate these).
+	var inTotal uint64
+	inTs := base.NilLedgerTime
+	for _, o := range inputs {
+		inTotal += o.Output.TokenBalance()
+		inTs = base.MaximumTime(inTs, o.Timestamp())
 	}
 
 	// Timestamp: max input ts + pace
@@ -279,15 +282,6 @@ func (s *Sender) buildOneTx(inputs []*ledger.OutputWithID, pace int, seqInfo Seq
 		return nil, base.TransactionID{}, nil, fmt.Errorf("pace violation")
 	}
 
-	// Unlock params
-	for i := range inputs {
-		if i == 0 {
-			txb.PutSignatureUnlock(0)
-		} else {
-			_ = txb.PutUnlockReference(byte(i), ledger.ConstraintIndexLock, 0)
-		}
-	}
-
 	transferAmount := s.cfg.Global.TransferAmount
 	tagAlongFee := uint64(0)
 	if includeTagAlong {
@@ -298,52 +292,66 @@ func (s *Sender) buildOneTx(inputs []*ledger.OutputWithID, pace int, seqInfo Seq
 		return nil, base.TransactionID{}, nil, fmt.Errorf("insufficient balance: have %d, need %d", inTotal, transferAmount+tagAlongFee)
 	}
 
+	// Raw composer; UpgradeIndex from the library version at the target slot.
+	txb := txbuildercore.New(ledger.L(ts.Slot).UpgradeIndex())
+
+	// Consume inputs (bytes-only) and wire the standard unlock pattern:
+	// input 0 signs, inputs 1..n reference input 0's lock.
+	for _, o := range inputs {
+		txb.ConsumeOutput(o.Output.Bytes(), o.ID)
+	}
+	if err := txb.PutStandardInputUnlocks(len(inputs)); err != nil {
+		return nil, base.TransactionID{}, nil, err
+	}
+
 	// Target output
 	targetLock := s.resolveTarget()
 	targetOut := ledger.NewOutput(func(o *ledger.OutputBuilder) {
 		o.WithTokenBalance(transferAmount).WithLock(targetLock)
 	})
-	if _, err = txb.ProduceOutput(targetOut); err != nil {
-		return nil, base.TransactionID{}, nil, fmt.Errorf("produce target: %w", err)
-	}
+	txb.ProduceOutput(targetOut.Bytes())
 
 	// Tag-along output (only on last tx in batch)
 	if tagAlongFee > 0 {
 		taOut := ledger.NewTagAlongOutput(tagAlongFee, seqInfo.ChainID, s.holderID)
-		if _, err = txb.ProduceOutput(taOut); err != nil {
-			return nil, base.TransactionID{}, nil, fmt.Errorf("produce tag-along: %w", err)
-		}
+		txb.ProduceOutput(taOut.Bytes())
 	}
 
-	// Remainder output
-	var remainderOut *ledger.OutputWithID
+	// Remainder output (produced last, so its index is NumOutputs()-1)
 	remainderAmount := inTotal - transferAmount - tagAlongFee
 	if remainderAmount > 0 {
 		remOut := ledger.NewOutput(func(o *ledger.OutputBuilder) {
 			o.WithTokenBalance(remainderAmount).WithLock(s.account)
 		})
-		remIdx, err := txb.ProduceOutput(remOut)
-		if err != nil {
-			return nil, base.TransactionID{}, nil, fmt.Errorf("produce remainder: %w", err)
-		}
-		// We'll fill in the OutputID after we know the txID
-		_ = remIdx
+		txb.ProduceOutput(remOut.Bytes())
 	}
 
-	txb.TransactionData.Timestamp = ts
-	txb.TransactionData.InputCommitment = ledger.HashOutputs(txb.ConsumedOutputs...)
+	// Finalise: timestamp, input commitment, signature.
+	txb.SetTimestamp(ts)
+	txb.ComputeInputCommitment()
 	txb.SignED25519(s.privateKey)
 
-	txBytes, txID, txStr, err := txb.BytesWithValidation()
+	txBytes := txb.Bytes()
+	consumed := txb.ConsumedOutputBytes()
+	tx, err := transaction.ParseAndValidate(txBytes, func(i byte) ([]byte, error) {
+		if int(i) >= len(consumed) {
+			return nil, fmt.Errorf("no consumed output %d", i)
+		}
+		return consumed[i], nil
+	})
 	if err != nil {
-		return nil, base.TransactionID{}, nil, fmt.Errorf("validation: %w\n%s", err, txStr)
+		diag := ""
+		if tx != nil {
+			diag = "\n" + tx.String()
+		}
+		return nil, base.TransactionID{}, nil, fmt.Errorf("validation: %w%s", err, diag)
 	}
+	txID := tx.ID()
 
 	// Build remainder OutputWithID for chaining
+	var remainderOut *ledger.OutputWithID
 	if remainderAmount > 0 {
-		// Remainder is the last produced output
-		numOutputs := txb.NumOutputs()
-		remOID := base.MustNewOutputID(txID, byte(numOutputs-1))
+		remOID := base.MustNewOutputID(txID, byte(txb.NumOutputs()-1))
 		remOut := ledger.NewOutput(func(o *ledger.OutputBuilder) {
 			o.WithTokenBalance(remainderAmount).WithLock(s.account)
 		})
