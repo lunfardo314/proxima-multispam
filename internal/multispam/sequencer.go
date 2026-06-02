@@ -5,7 +5,6 @@ import (
 	"sync"
 
 	"github.com/lunfardo314/proxima/api/client"
-	"github.com/lunfardo314/proxima/ledger"
 	"github.com/lunfardo314/proxima/ledger/base"
 )
 
@@ -35,11 +34,13 @@ func (sr *SequencerRegistry) Refresh(clnt *client.APIClient) error {
 
 	var infos []SequencerInfo
 	for chainID, seqOut := range seqOutputs {
-		sd, err := ledger.ParseSequencerData(seqOut.Output)
-		if err != nil {
+		// GetAllSequencerOutputs already parsed the sequencer data
+		// wallet-side (library fetched from the host); read the fee
+		// straight off it, no singleton.
+		if seqOut.SequencerData == nil {
 			continue
 		}
-		fee := sd.MinimumFee()
+		fee := seqOut.SequencerData.MinimumFee()
 		if fee == 0 {
 			fee = 1
 		}

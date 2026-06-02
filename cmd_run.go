@@ -37,7 +37,11 @@ func runRunCmd(cmd *cobra.Command, _ []string) {
 		viper.Set("api.timeout_sec", int(firstHost.Timeout.Seconds()))
 	}
 
-	glb.InitLedgerFromNode()
+	// Wasm-wallet state fetched from the node (no ledger.L() singleton):
+	// the library for composing outputs and the runtime constants for
+	// clock/pace math.
+	lib := glb.GetTxLibrary()
+	constants := glb.GetLedgerConstants()
 
 	numSenders, _ := cmd.Flags().GetInt("senders")
 	maxDuration, _ := cmd.Flags().GetDuration("max-duration")
@@ -46,6 +50,8 @@ func runRunCmd(cmd *cobra.Command, _ []string) {
 	coord, err := multispam.NewCoordinator(multispam.CoordinatorParams{
 		Config:          cfg,
 		NumSenders:      numSenders,
+		Library:         lib,
+		Constants:       constants,
 		MaxDuration:     maxDuration,
 		MaxTransactions: maxTx,
 		LogFunc: func(format string, args ...any) {

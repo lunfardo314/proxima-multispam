@@ -4,14 +4,10 @@ import (
 	"fmt"
 	"time"
 
-	"crypto/ed25519"
-
 	"github.com/lunfardo314/proxima-multispam/internal/multispam"
 	"github.com/lunfardo314/proxima/api"
 	"github.com/lunfardo314/proxima/api/client"
-	"github.com/lunfardo314/proxima/ledger"
 	"github.com/lunfardo314/proxima/ledger/base"
-	"github.com/lunfardo314/proxima/ledger/transaction"
 	"github.com/lunfardo314/proxima/ledger/txbuildercore"
 	"github.com/lunfardo314/proxima/proxi/glb"
 	"github.com/spf13/cobra"
@@ -36,7 +32,6 @@ func initFundCmd() *cobra.Command {
 
 func runFundCmd(cmd *cobra.Command, _ []string) {
 	glb.ReadInConfig()
-	glb.InitLedgerFromNode()
 
 	configFile := viper.GetString("multispam-config")
 	cfg, err := multispam.LoadConfig(configFile)
@@ -55,25 +50,29 @@ func runFundCmd(cmd *cobra.Command, _ []string) {
 		senders = filterSenders(cfg.Senders, senderNames)
 	}
 
+	// Wasm-wallet state (no ledger.L() singleton).
 	walletData := glb.GetWalletData()
 	clnt := glb.GetClient()
+	lib := glb.GetTxLibrary()
+	walletHolderID := base.HolderIDFromED25519PrivateKey(walletData.PrivateKey)
 
 	tagAlongSeqID := glb.GetTagAlongSequencerID()
+	glb.Assertf(tagAlongSeqID != nil, "tag-along sequencer not specified (set tag_along.sequencer_id)")
 	tagAlongFee := glb.GetTagAlongFee()
 	if tagAlongFee == 0 {
 		tagAlongFee = 1
 	}
 
-	// Resolve sender addresses
+	// Resolve sender holder IDs
 	type target struct {
-		name string
-		addr ledger.Lock
+		name     string
+		holderID base.HolderID
 	}
 	targets := make([]target, len(senders))
 	for i, s := range senders {
 		addr, err := multispam.SenderAddress(s.KeyFile)
 		glb.AssertNoError(err)
-		targets[i] = target{name: s.Name, addr: addr}
+		targets[i] = target{name: s.Name, holderID: base.HolderID(addr)}
 	}
 
 	glb.Infof("funding %d senders with %d tokens each from wallet", len(targets), amount)
@@ -87,8 +86,7 @@ func runFundCmd(cmd *cobra.Command, _ []string) {
 		batch := targets[batchStart:batchEnd]
 
 		totalNeeded := amount*uint64(len(batch)) + tagAlongFee
-		walletAccount := ledger.SigLockFromED25519PrivateKey(walletData.PrivateKey)
-		res, err := clnt.GetOutputsForControllerID(walletAccount.ControllerID().Bytes(), client.GetOutputsParams{
+		res, err := clnt.GetOutputsForControllerID(walletData.Account.ControllerID().Bytes(), client.GetOutputsParams{
 			LockType:  api.GetOutputsLockTypeSigLock,
 			Chained:   client.NonChainedOnly(),
 			SortBy:    api.GetOutputsSortByAmount,
@@ -99,70 +97,45 @@ func runFundCmd(cmd *cobra.Command, _ []string) {
 		glb.Assertf(res.AvailableAmount >= totalNeeded, "not enough tokens: have %d, need %d", res.AvailableAmount, totalNeeded)
 		walletOutputs := res.Outputs
 
-		// Build multi-output transaction with the raw bytes-only composer.
+		// Build multi-output transaction with the wasm-wallet composer.
+		txb := txbuildercore.New(0)
+
 		var inTotal uint64
-		inTs := base.NilLedgerTime
-		for _, o := range walletOutputs {
-			inTotal += o.Output.TokenBalance()
-			inTs = base.MaximumTime(inTs, o.Timestamp())
-		}
-
-		ts := ledger.TimeNow()
-		glb.Assertf(ledger.ValidTransactionPace(inTs, ts), "timestamp pace violation, try again shortly")
-
-		txb := txbuildercore.New(ledger.L(ts.Slot).UpgradeIndex())
-
-		// Consume inputs and wire the standard unlock pattern:
-		// input 0 signs, inputs 1..n reference input 0's lock.
 		for _, o := range walletOutputs {
 			txb.ConsumeOutput(o.Output.Bytes(), o.ID)
+			inTotal += o.Output.TokenBalance()
 		}
 		err = txb.PutStandardInputUnlocks(len(walletOutputs))
 		glb.AssertNoError(err)
 
-		// Produce one output per target
+		// Produce one sigLock output per target
 		for _, t := range batch {
-			out := ledger.NewOutput(func(o *ledger.OutputBuilder) {
-				o.WithTokenBalance(amount).WithLock(t.addr)
-			})
+			out, err := txbuildercore.NewSigLockOutput(lib, amount, t.holderID)
+			glb.AssertNoError(err)
 			txb.ProduceOutput(out.Bytes())
 		}
 
 		// Produce tag-along output
-		holderID := base.HolderIDFromPublicKey(base.SignatureTypeED25519, walletData.PrivateKey.Public().(ed25519.PublicKey))
-		tagAlongOut := ledger.NewTagAlongOutput(tagAlongFee, *tagAlongSeqID, holderID)
+		tagAlongOut, err := txbuildercore.NewTagAlongOutput(lib, tagAlongFee, *tagAlongSeqID, walletHolderID)
+		glb.AssertNoError(err)
 		txb.ProduceOutput(tagAlongOut.Bytes())
 
 		// Produce remainder if needed
 		spent := amount*uint64(len(batch)) + tagAlongFee
 		if inTotal > spent {
-			remainderOut := ledger.NewOutput(func(o *ledger.OutputBuilder) {
-				o.WithTokenBalance(inTotal - spent).WithLock(walletAccount)
-			})
+			remainderOut, err := txbuildercore.NewSigLockOutput(lib, inTotal-spent, walletHolderID)
+			glb.AssertNoError(err)
 			txb.ProduceOutput(remainderOut.Bytes())
 		}
 
-		// Finalise: timestamp, input commitment, signature.
-		txb.SetTimestamp(ts)
+		// Finalise: timestamp (node's current ledger slot), commitment, signature.
+		txb.SetTimestamp(base.T(glb.GetLedgerTimeNow().Slot, 10))
 		txb.ComputeInputCommitment()
 		txb.SignED25519(walletData.PrivateKey)
 
 		txBytes := txb.Bytes()
-		consumed := txb.ConsumedOutputBytes()
-		tx, err := transaction.ParseAndValidate(txBytes, func(i byte) ([]byte, error) {
-			if int(i) >= len(consumed) {
-				return nil, fmt.Errorf("no consumed output %d", i)
-			}
-			return consumed[i], nil
-		})
-		if err != nil {
-			diag := ""
-			if tx != nil {
-				diag = "\n" + tx.String()
-			}
-			glb.Fatalf("transaction validation failed: %v%s", err, diag)
-		}
-		txid := tx.ID()
+		txid, err := txbuildercore.TxIDFromBytes(txBytes)
+		glb.AssertNoError(err)
 
 		err = clnt.SubmitTransaction(txBytes)
 		glb.AssertNoError(err)

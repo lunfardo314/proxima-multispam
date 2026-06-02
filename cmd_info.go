@@ -30,8 +30,6 @@ func runInfoCmd(_ *cobra.Command, _ []string) {
 		viper.Set("api.timeout_sec", int(firstHost.Timeout.Seconds()))
 	}
 
-	glb.InitLedgerFromNode()
-
 	clnt := glb.GetClient()
 
 	fmt.Printf("%-12s %-20s %8s %15s\n", "Name", "Holder ID", "Outputs", "Balance")

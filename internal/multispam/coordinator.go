@@ -8,15 +8,17 @@ import (
 	"time"
 
 	"github.com/lunfardo314/proxima/api/client"
-	"github.com/lunfardo314/proxima/ledger"
+	"github.com/lunfardo314/proxima/ledger/base"
+	"github.com/lunfardo314/proxima/ledger/txbuildercore"
 )
 
 // Coordinator manages multiple senders, sequencer discovery, and display.
 type Coordinator struct {
-	cfg     *Config
-	senders []*Sender
-	seqReg  *SequencerRegistry
-	logFunc func(format string, args ...any)
+	cfg       *Config
+	senders   []*Sender
+	seqReg    *SequencerRegistry
+	constants *txbuildercore.Constants
+	logFunc   func(format string, args ...any)
 
 	maxDuration     time.Duration
 	maxTransactions int64
@@ -25,6 +27,8 @@ type Coordinator struct {
 type CoordinatorParams struct {
 	Config          *Config
 	NumSenders      int // 0 means all
+	Library         *txbuildercore.Library[any]
+	Constants       *txbuildercore.Constants
 	MaxDuration     time.Duration
 	MaxTransactions int64
 	LogFunc         func(format string, args ...any)
@@ -39,8 +43,8 @@ func NewCoordinator(par CoordinatorParams) (*Coordinator, error) {
 
 	seqReg := NewSequencerRegistry()
 
-	// Load all sender keys and addresses (for target resolution)
-	allAddrs := make([]ledger.SigLock, numSenders)
+	// Load all sender keys and holder IDs (for target resolution)
+	allHolderIDs := make([]base.HolderID, numSenders)
 	keys := make([]ed25519.PrivateKey, numSenders)
 	for i := 0; i < numSenders; i++ {
 		privKey, err := LoadSenderKey(cfg.Senders[i].KeyFile)
@@ -48,7 +52,7 @@ func NewCoordinator(par CoordinatorParams) (*Coordinator, error) {
 			return nil, fmt.Errorf("loading key for sender '%s': %w", cfg.Senders[i].Name, err)
 		}
 		keys[i] = privKey
-		allAddrs[i] = ledger.SigLockFromED25519PrivateKey(privKey)
+		allHolderIDs[i] = base.HolderIDFromED25519PrivateKey(privKey)
 	}
 
 	senders := make([]*Sender, numSenders)
@@ -58,8 +62,10 @@ func NewCoordinator(par CoordinatorParams) (*Coordinator, error) {
 			Index:      i,
 			PrivateKey: keys[i],
 			Config:     cfg,
+			Library:    par.Library,
+			Constants:  par.Constants,
 			SeqPicker:  NewSequencerPicker(seqReg, cfg.Global.SequencerStrategy),
-			Targets:    allAddrs,
+			Targets:    allHolderIDs,
 			LogFunc:    par.LogFunc,
 		})
 	}
@@ -68,6 +74,7 @@ func NewCoordinator(par CoordinatorParams) (*Coordinator, error) {
 		cfg:             cfg,
 		senders:         senders,
 		seqReg:          seqReg,
+		constants:       par.Constants,
 		logFunc:         par.LogFunc,
 		maxDuration:     par.MaxDuration,
 		maxTransactions: par.MaxTransactions,
@@ -103,7 +110,7 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	c.log("started %d sender(s), strategy: %s", len(c.senders), c.cfg.Global.TargetStrategy)
 
 	// Display + sequencer refresh loop
-	slotDuration := ledger.SlotDuration()
+	slotDuration := c.constants.SlotDuration()
 	ticker := time.NewTicker(slotDuration)
 	defer ticker.Stop()
 

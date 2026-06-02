@@ -11,7 +11,6 @@ import (
 	"github.com/lunfardo314/proxima/api/client"
 	"github.com/lunfardo314/proxima/ledger"
 	"github.com/lunfardo314/proxima/ledger/base"
-	"github.com/lunfardo314/proxima/ledger/transaction"
 	"github.com/lunfardo314/proxima/ledger/txbuildercore"
 )
 
@@ -21,19 +20,35 @@ type spentEntry struct {
 	SubmittedSlot uint32
 }
 
+// spendable is a wallet-side consumable output: raw output wire-bytes +
+// its OutputID + token amount. It decouples batch-chaining (consuming a
+// tx's own remainder before it is confirmed) from *ledger.OutputWithID,
+// so a produced output never needs to be parsed back through a ledger
+// library — we already know its bytes, id and amount at build time.
+type spendable struct {
+	id     base.OutputID
+	bytes  []byte
+	amount uint64
+}
+
 // Sender is an autonomous goroutine that continuously sends transactions from one account.
 type Sender struct {
 	name       string
 	index      int // position in the sender list (for "next" strategy)
 	privateKey ed25519.PrivateKey
-	account    ledger.SigLock
+	account    ledger.SigLock // sigLock controller, used to query owned outputs
 	holderID   base.HolderID
+
+	// Wallet state (singleton-free): library for composing outputs and
+	// constants for clock/pace math. Fetched once and shared read-only.
+	lib       *txbuildercore.Library[any]
+	constants *txbuildercore.Constants
 
 	cfg       *Config
 	hosts     []HostConfig
 	hostIdx   int
 	seqPicker *SequencerPicker
-	targets   []ledger.SigLock // all sender addresses for target strategies
+	targets   []base.HolderID // all sender holder IDs for target strategies
 	spentSet  map[base.OutputID]spentEntry
 	metrics   *SenderMetrics
 	logFunc   func(format string, args ...any)
@@ -52,19 +67,22 @@ type SenderParams struct {
 	Index      int
 	PrivateKey ed25519.PrivateKey
 	Config     *Config
+	Library    *txbuildercore.Library[any]
+	Constants  *txbuildercore.Constants
 	SeqPicker  *SequencerPicker
-	Targets    []ledger.SigLock
+	Targets    []base.HolderID
 	LogFunc    func(format string, args ...any)
 }
 
 func NewSender(par SenderParams) *Sender {
-	account := ledger.SigLockFromED25519PrivateKey(par.PrivateKey)
 	return &Sender{
 		name:       par.Name,
 		index:      par.Index,
 		privateKey: par.PrivateKey,
-		account:    account,
-		holderID:   base.HolderIDFromPublicKey(base.SignatureTypeED25519, par.PrivateKey.Public().(ed25519.PublicKey)),
+		account:    ledger.SigLockFromED25519PrivateKey(par.PrivateKey),
+		holderID:   base.HolderIDFromED25519PrivateKey(par.PrivateKey),
+		lib:        par.Library,
+		constants:  par.Constants,
 		cfg:        par.Config,
 		hosts:      par.Config.APIHosts,
 		seqPicker:  par.SeqPicker,
@@ -80,8 +98,8 @@ func (s *Sender) Name() string            { return s.name }
 
 // Run is the main sender loop. Blocks until context is cancelled.
 func (s *Sender) Run(ctx context.Context) {
-	pace := int(ledger.L(base.MaxSlot).TransactionPace)
-	paceDuration := time.Duration(pace) * ledger.TickDuration()
+	pace := int(s.constants.TransactionPace)
+	paceDuration := time.Duration(pace) * s.constants.TickDuration
 	mindRateControl := s.cfg.IsMindRateControl()
 
 	for {
@@ -118,24 +136,26 @@ func (s *Sender) doRound(pace int) bool {
 
 	s.metrics.LastBalance.Store(totalBalance)
 
-	// Build a set of output IDs in current LRB for fast lookup
-	lrbOutputs := make(map[base.OutputID]*ledger.OutputWithID, len(outs))
+	// LRB membership set, for spentSet maintenance.
+	lrbSet := make(map[base.OutputID]struct{}, len(outs))
 	for _, o := range outs {
-		lrbOutputs[o.ID] = o
+		lrbSet[o.ID] = struct{}{}
 	}
 
 	// Step 2: Classify outputs and maintain spentSet
-	currentSlot := ledger.TimeNow().Slot
-	s.classifyOutputs(lrbOutputs, currentSlot, clnt)
+	currentSlot := s.constants.LedgerTimeFromClockTime(time.Now()).Slot
+	s.classifyOutputs(lrbSet, currentSlot, clnt)
 
-	// Collect available outputs (in LRB and not in spentSet)
-	var available []*ledger.OutputWithID
+	// Collect spendable outputs (in LRB and not in spentSet)
+	var available []spendable
 	var availableBalance uint64
 	for _, o := range outs {
-		if _, spent := s.spentSet[o.ID]; !spent {
-			available = append(available, o)
-			availableBalance += o.Output.TokenBalance()
+		if _, spent := s.spentSet[o.ID]; spent {
+			continue
 		}
+		amt := o.Output.TokenBalance()
+		available = append(available, spendable{id: o.ID, bytes: o.Output.Bytes(), amount: amt})
+		availableBalance += amt
 	}
 
 	if len(available) == 0 {
@@ -152,9 +172,8 @@ func (s *Sender) doRound(pace int) bool {
 	// Step 4: Check minimum balance
 	transferAmount := s.cfg.Global.TransferAmount
 	tagAlongFee := seqInfo.Fee
-	// Estimate storage deposit for a sigLock output (~45 bytes → ~13.6M tokens minimum)
-	// Use a conservative minimum; the actual check happens in ProduceOutput
-	minNeeded := transferAmount + tagAlongFee + transferAmount // remainder needs at least storage deposit worth
+	// remainder needs at least storage deposit worth, so require 2x transfer + fee
+	minNeeded := transferAmount + tagAlongFee + transferAmount
 	if availableBalance < minNeeded {
 		return false
 	}
@@ -164,11 +183,11 @@ func (s *Sender) doRound(pace int) bool {
 }
 
 // classifyOutputs updates the spentSet based on current LRB state.
-func (s *Sender) classifyOutputs(lrbOutputs map[base.OutputID]*ledger.OutputWithID, currentSlot uint32, clnt *client.APIClient) {
+func (s *Sender) classifyOutputs(lrbSet map[base.OutputID]struct{}, currentSlot uint32, clnt *client.APIClient) {
 	finalitySlots := uint32(s.cfg.Global.FinalityTimeoutSlots)
 
 	for oid, entry := range s.spentSet {
-		if _, inLRB := lrbOutputs[oid]; !inLRB {
+		if _, inLRB := lrbSet[oid]; !inLRB {
 			// Output no longer in LRB — the spending tx was finalized (output consumed)
 			// or the output itself was consumed by someone else. Either way, remove.
 			delete(s.spentSet, oid)
@@ -193,7 +212,7 @@ func (s *Sender) classifyOutputs(lrbOutputs map[base.OutputID]*ledger.OutputWith
 	}
 }
 
-func (s *Sender) buildAndSubmitBatch(available []*ledger.OutputWithID, pace int, seqInfo SequencerInfo, clnt *client.APIClient) bool {
+func (s *Sender) buildAndSubmitBatch(available []spendable, pace int, seqInfo SequencerInfo, clnt *client.APIClient) bool {
 	batchSize := s.cfg.Global.BatchSize
 	anySent := false
 
@@ -202,14 +221,14 @@ func (s *Sender) buildAndSubmitBatch(available []*ledger.OutputWithID, pace int,
 	// Subsequent txs in the batch consume only the remainder output from the previous tx.
 
 	currentInputs := available
-	var remainderOutput *ledger.OutputWithID // output from previous tx in the batch
+	var remainderOutput *spendable // output from previous tx in the batch
 
 	for txIdx := 0; txIdx < batchSize; txIdx++ {
 		isLastInBatch := txIdx == batchSize-1
 
-		var inputs []*ledger.OutputWithID
+		var inputs []spendable
 		if remainderOutput != nil {
-			inputs = []*ledger.OutputWithID{remainderOutput}
+			inputs = []spendable{*remainderOutput}
 		} else {
 			inputs = currentInputs
 		}
@@ -239,7 +258,7 @@ func (s *Sender) buildAndSubmitBatch(available []*ledger.OutputWithID, pace int,
 		// Mark consumed inputs as spent
 		submittedSlot := txID.Timestamp().Slot
 		for _, inp := range inputs {
-			s.spentSet[inp.ID] = spentEntry{
+			s.spentSet[inp.id] = spentEntry{
 				TxID:          txID,
 				SubmittedSlot: submittedSlot,
 			}
@@ -259,27 +278,26 @@ func (s *Sender) buildAndSubmitBatch(available []*ledger.OutputWithID, pace int,
 	return anySent
 }
 
-// buildOneTx constructs a single transfer transaction.
+// buildOneTx constructs a single transfer transaction with the raw
+// wasm-wallet composer (txbuildercore + the wallet library). No ledger
+// singleton: produced outputs are composed via txbuildercore helpers and
+// the txID is derived from the signed bytes.
 // Returns txBytes, txID, remainder output (for chaining), or error.
-func (s *Sender) buildOneTx(inputs []*ledger.OutputWithID, pace int, seqInfo SequencerInfo, includeTagAlong bool) ([]byte, base.TransactionID, *ledger.OutputWithID, error) {
-	// Compute input total and the maximum input timestamp (the raw
-	// txbuildercore composer is bytes-only and does not aggregate these).
+func (s *Sender) buildOneTx(inputs []spendable, pace int, seqInfo SequencerInfo, includeTagAlong bool) ([]byte, base.TransactionID, *spendable, error) {
+	// Aggregate input total and the maximum input timestamp.
 	var inTotal uint64
 	inTs := base.NilLedgerTime
-	for _, o := range inputs {
-		inTotal += o.Output.TokenBalance()
-		inTs = base.MaximumTime(inTs, o.Timestamp())
+	for _, in := range inputs {
+		inTotal += in.amount
+		inTs = base.MaximumTime(inTs, in.id.Timestamp())
 	}
 
-	// Timestamp: max input ts + pace
+	// Timestamp: max input ts + pace, but never before "now". Both
+	// branches keep the pace invariant, so the node accepts the tx.
 	ts := inTs.AddTicks(pace)
-	now := ledger.TimeNow()
+	now := s.constants.LedgerTimeFromClockTime(time.Now())
 	if ts.Before(now) {
 		ts = now
-	}
-
-	if !ledger.ValidTransactionPace(inTs, ts) {
-		return nil, base.TransactionID{}, nil, fmt.Errorf("pace violation")
 	}
 
 	transferAmount := s.cfg.Global.TransferAmount
@@ -292,89 +310,83 @@ func (s *Sender) buildOneTx(inputs []*ledger.OutputWithID, pace int, seqInfo Seq
 		return nil, base.TransactionID{}, nil, fmt.Errorf("insufficient balance: have %d, need %d", inTotal, transferAmount+tagAlongFee)
 	}
 
-	// Raw composer; UpgradeIndex from the library version at the target slot.
-	txb := txbuildercore.New(ledger.L(ts.Slot).UpgradeIndex())
+	txb := txbuildercore.New(0)
 
-	// Consume inputs (bytes-only) and wire the standard unlock pattern:
+	// Consume inputs and wire the standard unlock pattern:
 	// input 0 signs, inputs 1..n reference input 0's lock.
-	for _, o := range inputs {
-		txb.ConsumeOutput(o.Output.Bytes(), o.ID)
-	}
-	if err := txb.PutStandardInputUnlocks(len(inputs)); err != nil {
-		return nil, base.TransactionID{}, nil, err
+	for i, in := range inputs {
+		txb.ConsumeOutput(in.bytes, in.id)
+		if i == 0 {
+			txb.PutSignatureUnlock(0)
+		} else {
+			if err := txb.PutUnlockReference(byte(i), txbuildercore.ConstraintIndexLock, 0); err != nil {
+				return nil, base.TransactionID{}, nil, err
+			}
+		}
 	}
 
-	// Target output
-	targetLock := s.resolveTarget()
-	targetOut := ledger.NewOutput(func(o *ledger.OutputBuilder) {
-		o.WithTokenBalance(transferAmount).WithLock(targetLock)
-	})
+	// Target output (sigLock to the resolved holder).
+	targetOut, err := txbuildercore.NewSigLockOutput(s.lib, transferAmount, s.resolveTarget())
+	if err != nil {
+		return nil, base.TransactionID{}, nil, fmt.Errorf("target output: %w", err)
+	}
 	txb.ProduceOutput(targetOut.Bytes())
 
 	// Tag-along output (only on last tx in batch)
 	if tagAlongFee > 0 {
-		taOut := ledger.NewTagAlongOutput(tagAlongFee, seqInfo.ChainID, s.holderID)
+		taOut, err := txbuildercore.NewTagAlongOutput(s.lib, tagAlongFee, seqInfo.ChainID, s.holderID)
+		if err != nil {
+			return nil, base.TransactionID{}, nil, fmt.Errorf("tag-along output: %w", err)
+		}
 		txb.ProduceOutput(taOut.Bytes())
 	}
 
-	// Remainder output (produced last, so its index is NumOutputs()-1)
+	// Remainder output back to self (produced last).
 	remainderAmount := inTotal - transferAmount - tagAlongFee
+	var remBytes []byte
+	var remIdx byte
 	if remainderAmount > 0 {
-		remOut := ledger.NewOutput(func(o *ledger.OutputBuilder) {
-			o.WithTokenBalance(remainderAmount).WithLock(s.account)
-		})
-		txb.ProduceOutput(remOut.Bytes())
+		remOut, err := txbuildercore.NewSigLockOutput(s.lib, remainderAmount, s.holderID)
+		if err != nil {
+			return nil, base.TransactionID{}, nil, fmt.Errorf("remainder output: %w", err)
+		}
+		remBytes = remOut.Bytes()
+		remIdx = txb.ProduceOutput(remBytes)
 	}
 
-	// Finalise: timestamp, input commitment, signature.
 	txb.SetTimestamp(ts)
 	txb.ComputeInputCommitment()
 	txb.SignED25519(s.privateKey)
 
 	txBytes := txb.Bytes()
-	consumed := txb.ConsumedOutputBytes()
-	tx, err := transaction.ParseAndValidate(txBytes, func(i byte) ([]byte, error) {
-		if int(i) >= len(consumed) {
-			return nil, fmt.Errorf("no consumed output %d", i)
-		}
-		return consumed[i], nil
-	})
+	txID, err := txbuildercore.TxIDFromBytes(txBytes)
 	if err != nil {
-		diag := ""
-		if tx != nil {
-			diag = "\n" + tx.String()
-		}
-		return nil, base.TransactionID{}, nil, fmt.Errorf("validation: %w%s", err, diag)
+		return nil, base.TransactionID{}, nil, fmt.Errorf("txid: %w", err)
 	}
-	txID := tx.ID()
 
-	// Build remainder OutputWithID for chaining
-	var remainderOut *ledger.OutputWithID
+	// Build remainder spendable for chaining.
+	var remainderOut *spendable
 	if remainderAmount > 0 {
-		remOID := base.MustNewOutputID(txID, byte(txb.NumOutputs()-1))
-		remOut := ledger.NewOutput(func(o *ledger.OutputBuilder) {
-			o.WithTokenBalance(remainderAmount).WithLock(s.account)
-		})
-		remainderOut = &ledger.OutputWithID{
-			ID:     remOID,
-			Output: remOut,
+		remainderOut = &spendable{
+			id:     base.MustNewOutputID(txID, remIdx),
+			bytes:  remBytes,
+			amount: remainderAmount,
 		}
 	}
 
 	return txBytes, txID, remainderOut, nil
 }
 
-// resolveTarget picks the target address based on strategy.
-func (s *Sender) resolveTarget() ledger.Lock {
+// resolveTarget picks the target holder ID based on strategy.
+func (s *Sender) resolveTarget() base.HolderID {
 	switch s.cfg.Global.TargetStrategy {
 	case StrategyNext:
 		nextIdx := (s.index + 1) % len(s.targets)
 		return s.targets[nextIdx]
 	case StrategyRandom:
-		idx := rand.Intn(len(s.targets))
-		return s.targets[idx]
+		return s.targets[rand.Intn(len(s.targets))]
 	default: // "self"
-		return s.account
+		return s.holderID
 	}
 }
 
