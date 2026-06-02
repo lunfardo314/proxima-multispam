@@ -3,7 +3,7 @@ module github.com/lunfardo314/proxima-multispam
 go 1.26.0
 
 require (
-	github.com/lunfardo314/proxima v0.8.0-develop
+	github.com/lunfardo314/proxima v0.8.0-develop.0.20260602121331-7a41c0db68e4
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 	gopkg.in/yaml.v3 v3.0.1

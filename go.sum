@@ -52,8 +52,8 @@ github.com/libp2p/go-libp2p v0.48.0 h1:h2BrLAgrj7X8bEN05K7qmrjpNHYA+6tnsGRdprjTn
 github.com/libp2p/go-libp2p v0.48.0/go.mod h1:Q1fBZNdmC2Hf82husCTfkKJVfHm2we5zk+NWmOGEmWk=
 github.com/lunfardo314/easyfl v0.0.0-20260523035634-ffd00200bdba h1:BM2R7mKpvm0v5iimxGf4n9vgSAcHP5xgpihRxX6bXWE=
 github.com/lunfardo314/easyfl v0.0.0-20260523035634-ffd00200bdba/go.mod h1:XjGR4UuUPDdBV1w/aKqoQjVsUj6wJAZhHhaZPWXH2MY=
-github.com/lunfardo314/proxima v0.8.0-develop h1:MgCS7VyLDmwClrN5vNXArqTQ/BrP6I2dIp8zWA35vbo=
-github.com/lunfardo314/proxima v0.8.0-develop/go.mod h1:rt8A21t+VSlOKa5V4hfDBkCErAUT6Yv6OZhb7DPR0c0=
+github.com/lunfardo314/proxima v0.8.0-develop.0.20260602121331-7a41c0db68e4 h1:Vp8KFcjsnX26mc30nScjHvw2bqgA+ed0ZInweG9xc1k=
+github.com/lunfardo314/proxima v0.8.0-develop.0.20260602121331-7a41c0db68e4/go.mod h1:rt8A21t+VSlOKa5V4hfDBkCErAUT6Yv6OZhb7DPR0c0=
 github.com/lunfardo314/unitrie v0.0.0-20260430152328-b888b7a3ad49 h1:deV0mXHHAZbEmVfGutb/xg3a7tUAfyrtiwrMPrZLvSw=
 github.com/lunfardo314/unitrie v0.0.0-20260430152328-b888b7a3ad49/go.mod h1:69UhxzxQ7UVhI9Knv50D/uVxsJseC7myW1DUlWelSo4=
 github.com/minio/sha256-simd v1.0.1 h1:6kaan5IFmwTNynnKKpDHe6FWHohJOHhCPchzK49dzMM=
