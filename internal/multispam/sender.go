@@ -52,6 +52,7 @@ type Sender struct {
 	spentSet  map[base.OutputID]spentEntry
 	metrics   *SenderMetrics
 	logFunc   func(format string, args ...any)
+	verbose   bool
 
 	// minStorageDeposit is the sigLock storage-deposit floor (computed once,
 	// wallet-side). A produced sigLock output below it makes the tx invalid.
@@ -76,6 +77,7 @@ type SenderParams struct {
 	SeqPicker  *SequencerPicker
 	Targets    []base.HolderID
 	LogFunc    func(format string, args ...any)
+	Verbose    bool
 
 	// MinStorageDeposit is the sigLock storage-deposit floor (see Sender).
 	MinStorageDeposit uint64
@@ -97,6 +99,7 @@ func NewSender(par SenderParams) *Sender {
 		spentSet:   make(map[base.OutputID]spentEntry),
 		metrics:    &SenderMetrics{},
 		logFunc:    par.LogFunc,
+		verbose:    par.Verbose,
 
 		minStorageDeposit: par.MinStorageDeposit,
 	}
@@ -180,13 +183,15 @@ func (s *Sender) doRound(pace int) bool {
 
 	// Step 4: Check minimum balance. A sender with funds below the floor for a
 	// single valid transfer cannot transact without producing a dust remainder
-	// (which the node silently rejects), so surface it as an error instead of
-	// idling silently. Senders with zero spendable outputs were already handled
-	// above and stay quiet.
+	// (which the node silently rejects). This is expected while waiting for
+	// funding to arrive, so only surface it under -v to avoid noise. Senders
+	// with zero spendable outputs were already handled above and stay quiet.
 	minForOneTx := s.cfg.MinBalanceForOneTx(seqInfo.Fee, s.minStorageDeposit)
 	if availableBalance < minForOneTx {
-		s.log("UNDERFUNDED: spendable %d < minimum %d (transfer %d + fee %d + storage deposit %d) — fund this sender",
-			availableBalance, minForOneTx, s.cfg.Global.TransferAmount, seqInfo.Fee, s.minStorageDeposit)
+		if s.verbose {
+			s.log("UNDERFUNDED: spendable %d < minimum %d (transfer %d + fee %d + storage deposit %d) — fund this sender",
+				availableBalance, minForOneTx, s.cfg.Global.TransferAmount, seqInfo.Fee, s.minStorageDeposit)
+		}
 		return false
 	}
 

@@ -31,6 +31,7 @@ type CoordinatorParams struct {
 	Constants       *txbuildercore.Constants
 	MaxDuration     time.Duration
 	MaxTransactions int64
+	Verbose         bool
 	LogFunc         func(format string, args ...any)
 }
 
@@ -49,6 +50,14 @@ func NewCoordinator(par CoordinatorParams) (*Coordinator, error) {
 	minStorageDeposit, err := MinStorageDepositSigLock(par.Library, newFirstClient(cfg))
 	if err != nil {
 		return nil, fmt.Errorf("computing storage-deposit floor: %w", err)
+	}
+	// Each transfer produces a sigLock target output carrying exactly
+	// transfer_amount; below the storage-deposit floor it is dust and the node
+	// rejects every spam tx regardless of funding. Refuse to run rather than
+	// burn a session producing only invalid transactions.
+	if cfg.Global.TransferAmount < minStorageDeposit {
+		return nil, fmt.Errorf("transfer_amount %d is below the sigLock storage-deposit floor %d: every target output would be dust and rejected by the node",
+			cfg.Global.TransferAmount, minStorageDeposit)
 	}
 	if par.LogFunc != nil {
 		par.LogFunc("sigLock storage-deposit floor: %d (per-sender outputs below this are rejected by the node)", minStorageDeposit)
@@ -78,6 +87,7 @@ func NewCoordinator(par CoordinatorParams) (*Coordinator, error) {
 			SeqPicker:  NewSequencerPicker(seqReg, cfg.Global.SequencerStrategy),
 			Targets:    allHolderIDs,
 			LogFunc:    par.LogFunc,
+			Verbose:    par.Verbose,
 
 			MinStorageDeposit: minStorageDeposit,
 		})

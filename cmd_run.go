@@ -54,6 +54,7 @@ func runRunCmd(cmd *cobra.Command, _ []string) {
 		Constants:       constants,
 		MaxDuration:     maxDuration,
 		MaxTransactions: maxTx,
+		Verbose:         glb.IsVerbose(),
 		LogFunc: func(format string, args ...any) {
 			glb.Infof(format, args...)
 		},

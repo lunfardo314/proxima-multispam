@@ -121,4 +121,13 @@ func runInfoCmd(_ *cobra.Command, _ []string) {
 		fmt.Printf("\n  WARNING: %d sender(s) underfunded — their transactions will be rejected by the node\n", underfundedCount)
 		fmt.Printf("           (dust remainder below the %d storage-deposit floor). Fund them before running.\n", minStorageDeposit)
 	}
+	// Each transfer produces a sigLock target output carrying exactly
+	// transfer_amount. If that is below the storage-deposit floor, every target
+	// output is dust and the node rejects every spam tx no matter how well the
+	// senders are funded — so flag it independently of the per-sender numbers.
+	if cfg.Global.TransferAmount < minStorageDeposit {
+		fmt.Printf("\n  WARNING: transfer_amount %d is below the sigLock storage-deposit floor %d.\n", cfg.Global.TransferAmount, minStorageDeposit)
+		fmt.Printf("           Every target output would be dust and rejected by the node, regardless of\n")
+		fmt.Printf("           funding. Raise transfer_amount to at least %d.\n", minStorageDeposit)
+	}
 }
