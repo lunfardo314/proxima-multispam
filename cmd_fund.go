@@ -137,7 +137,16 @@ func runFundCmd(cmd *cobra.Command, _ []string) {
 		txid, err := txbuildercore.TxIDFromBytes(txBytes)
 		glb.AssertNoError(err)
 
-		err = clnt.SubmitTransaction(txBytes)
+		// Submit with the consumed UTXOs so the node runs full-context
+		// validation synchronously and rejects (e.g. on a storage-deposit
+		// violation) instead of accepting and silently dropping the tx
+		// during async attachment. On rejection SubmitAndDisplay prints
+		// the node error plus the full rendering of the invalid tx.
+		consumedUTXOBytes := make([][]byte, len(walletOutputs))
+		for i, o := range walletOutputs {
+			consumedUTXOBytes[i] = o.Output.Bytes()
+		}
+		err = glb.SubmitAndDisplay(txBytes, consumedUTXOBytes...)
 		glb.AssertNoError(err)
 
 		for _, t := range batch {
