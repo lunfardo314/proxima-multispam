@@ -63,6 +63,19 @@ func (sr *SequencerRegistry) Count() int {
 	return len(sr.sequencers)
 }
 
+// MaxFee returns the largest minimum-fee among known sequencers, together with
+// the number of sequencers. Using the maximum makes the participation-minimum
+// calculation valid for any sequencer a sender might tag along with.
+func (sr *SequencerRegistry) MaxFee() (maxFee uint64, count int) {
+	seqs := sr.snapshot()
+	for _, s := range seqs {
+		if s.Fee > maxFee {
+			maxFee = s.Fee
+		}
+	}
+	return maxFee, len(seqs)
+}
+
 // snapshot returns a copy of the current sequencer list.
 func (sr *SequencerRegistry) snapshot() []SequencerInfo {
 	sr.mu.RLock()

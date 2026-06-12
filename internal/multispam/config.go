@@ -71,6 +71,25 @@ func (cfg *Config) IsMindRateControl() bool {
 	return cfg.Global.MindRateControl == nil || *cfg.Global.MindRateControl
 }
 
+// MinBalanceToParticipate is the minimum spendable balance a sender needs to
+// start a round: one transfer, the tag-along fee, and a remainder at least one
+// more transfer worth so the next round can be seeded. This mirrors the gate
+// in Sender.doRound. transfer_amount (default 100M) is well above the per-output
+// storage deposit (~13.6M for a sigLock output), so the storage-deposit floor
+// for the produced outputs is automatically satisfied. Batch size does not raise
+// this entry threshold; it only increases how much of the balance is spent per
+// round (see PerRoundMaxSpend).
+func (cfg *Config) MinBalanceToParticipate(tagAlongFee uint64) uint64 {
+	return 2*cfg.Global.TransferAmount + tagAlongFee
+}
+
+// PerRoundMaxSpend is the most a sender consumes in one full batch round:
+// batch_size transfers plus a single tag-along fee (charged once, on the last
+// tx in the batch).
+func (cfg *Config) PerRoundMaxSpend(tagAlongFee uint64) uint64 {
+	return uint64(cfg.Global.BatchSize)*cfg.Global.TransferAmount + tagAlongFee
+}
+
 func (cfg *Config) applyDefaults() {
 	if cfg.Global.TransferAmount == 0 {
 		cfg.Global.TransferAmount = DefaultTransferAmount

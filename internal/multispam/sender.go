@@ -170,11 +170,7 @@ func (s *Sender) doRound(pace int) bool {
 	}
 
 	// Step 4: Check minimum balance
-	transferAmount := s.cfg.Global.TransferAmount
-	tagAlongFee := seqInfo.Fee
-	// remainder needs at least storage deposit worth, so require 2x transfer + fee
-	minNeeded := transferAmount + tagAlongFee + transferAmount
-	if availableBalance < minNeeded {
+	if availableBalance < s.cfg.MinBalanceToParticipate(seqInfo.Fee) {
 		return false
 	}
 
