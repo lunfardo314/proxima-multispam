@@ -71,23 +71,24 @@ func (cfg *Config) IsMindRateControl() bool {
 	return cfg.Global.MindRateControl == nil || *cfg.Global.MindRateControl
 }
 
-// MinBalanceToParticipate is the minimum spendable balance a sender needs to
-// start a round: one transfer, the tag-along fee, and a remainder at least one
-// more transfer worth so the next round can be seeded. This mirrors the gate
-// in Sender.doRound. transfer_amount (default 100M) is well above the per-output
-// storage deposit (~13.6M for a sigLock output), so the storage-deposit floor
-// for the produced outputs is automatically satisfied. Batch size does not raise
-// this entry threshold; it only increases how much of the balance is spent per
-// round (see PerRoundMaxSpend).
-func (cfg *Config) MinBalanceToParticipate(tagAlongFee uint64) uint64 {
-	return 2*cfg.Global.TransferAmount + tagAlongFee
+// MinBalanceForOneTx is the minimum spendable balance a sender needs to build a
+// single valid transfer that does not create a dust remainder: one transfer, the
+// tag-along fee, and a remainder that still clears the sigLock storage-deposit
+// floor. A remainder below minStorageDeposit makes the whole transaction invalid
+// (the node rejects it with "storage deposit not met"), so this floor is the real
+// gate, not just transfer+fee.
+func (cfg *Config) MinBalanceForOneTx(tagAlongFee, minStorageDeposit uint64) uint64 {
+	return cfg.Global.TransferAmount + tagAlongFee + minStorageDeposit
 }
 
-// PerRoundMaxSpend is the most a sender consumes in one full batch round:
-// batch_size transfers plus a single tag-along fee (charged once, on the last
-// tx in the batch).
-func (cfg *Config) PerRoundMaxSpend(tagAlongFee uint64) uint64 {
-	return uint64(cfg.Global.BatchSize)*cfg.Global.TransferAmount + tagAlongFee
+// MinFundingPerSender is the balance a sender needs to run one full batch round
+// without producing a dust (sub-storage-deposit) output: batch_size transfers,
+// a single tag-along fee (charged once, on the last tx in the batch), plus a
+// final remainder that still clears the storage-deposit floor. This is the
+// figure to fund each sender with; it is batch-size and storage-deposit
+// dependent.
+func (cfg *Config) MinFundingPerSender(tagAlongFee, minStorageDeposit uint64) uint64 {
+	return uint64(cfg.Global.BatchSize)*cfg.Global.TransferAmount + tagAlongFee + minStorageDeposit
 }
 
 func (cfg *Config) applyDefaults() {

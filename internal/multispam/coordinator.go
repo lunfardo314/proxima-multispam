@@ -43,6 +43,17 @@ func NewCoordinator(par CoordinatorParams) (*Coordinator, error) {
 
 	seqReg := NewSequencerRegistry()
 
+	// Storage-deposit floor for the sigLock outputs the spammer produces.
+	// Computed once, wallet-side, and shared read-only by all senders to gate
+	// funding and reject dust remainders.
+	minStorageDeposit, err := MinStorageDepositSigLock(par.Library, newFirstClient(cfg))
+	if err != nil {
+		return nil, fmt.Errorf("computing storage-deposit floor: %w", err)
+	}
+	if par.LogFunc != nil {
+		par.LogFunc("sigLock storage-deposit floor: %d (per-sender outputs below this are rejected by the node)", minStorageDeposit)
+	}
+
 	// Load all sender keys and holder IDs (for target resolution)
 	allHolderIDs := make([]base.HolderID, numSenders)
 	keys := make([]ed25519.PrivateKey, numSenders)
@@ -67,6 +78,8 @@ func NewCoordinator(par CoordinatorParams) (*Coordinator, error) {
 			SeqPicker:  NewSequencerPicker(seqReg, cfg.Global.SequencerStrategy),
 			Targets:    allHolderIDs,
 			LogFunc:    par.LogFunc,
+
+			MinStorageDeposit: minStorageDeposit,
 		})
 	}
 
@@ -191,7 +204,13 @@ func (c *Coordinator) printFinalStats(startTime time.Time) {
 }
 
 func (c *Coordinator) firstClient() *client.APIClient {
-	h := c.cfg.APIHosts[0]
+	return newFirstClient(c.cfg)
+}
+
+// newFirstClient builds a client against the first configured API host. Usable
+// before the Coordinator value exists (e.g. during construction).
+func newFirstClient(cfg *Config) *client.APIClient {
+	h := cfg.APIHosts[0]
 	return client.NewWithGoogleDNS(h.URL, h.Timeout)
 }
 

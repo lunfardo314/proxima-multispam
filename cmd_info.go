@@ -12,7 +12,7 @@ import (
 func initInfoCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "info",
-		Short: "display sender account balances",
+		Short: "display sender account balances and funding requirements",
 		Args:  cobra.NoArgs,
 		Run:   runInfoCmd,
 	}
@@ -32,9 +32,9 @@ func runInfoCmd(_ *cobra.Command, _ []string) {
 
 	clnt := glb.GetClient()
 
-	// Discover sequencer fees so the participation-minimum reflects the real
-	// tag-along fee. Use the largest minimum-fee so the figure holds for any
-	// sequencer a sender might pick. Fall back to 1 if discovery fails.
+	// Discover sequencer fees so the minimum reflects the real tag-along fee.
+	// Use the largest minimum-fee so the figure holds for any sequencer a
+	// sender might pick. Fall back to 1 if discovery fails.
 	tagAlongFee := uint64(1)
 	seqCount := 0
 	seqReg := multispam.NewSequencerRegistry()
@@ -47,10 +47,19 @@ func runInfoCmd(_ *cobra.Command, _ []string) {
 		seqCount = n
 	}
 
-	minPerSender := cfg.MinBalanceToParticipate(tagAlongFee)
+	// Storage-deposit floor for the sigLock outputs each sender produces. A
+	// produced sigLock output (target or remainder) below this makes the whole
+	// transaction invalid ("storage deposit not met"), so it is part of the
+	// minimum funding, not an afterthought.
+	minStorageDeposit, err := multispam.MinStorageDepositSigLock(glb.GetTxLibrary(), clnt)
+	glb.AssertNoError(err)
 
-	fmt.Printf("%-12s %-20s %8s %15s\n", "Name", "Holder ID", "Outputs", "Balance")
-	fmt.Printf("%-12s %-20s %8s %15s\n", "----", "---------", "-------", "-------")
+	// Per-sender minimum to run one full batch round without producing a dust
+	// (sub-storage-deposit) output. Batch-size and storage-deposit dependent.
+	minPerSender := cfg.MinFundingPerSender(tagAlongFee, minStorageDeposit)
+
+	fmt.Printf("%-12s %-20s %8s %18s  %s\n", "Name", "Holder ID", "Outputs", "Balance", "Status")
+	fmt.Printf("%-12s %-20s %8s %18s  %s\n", "----", "---------", "-------", "-------", "------")
 
 	var totalBalance uint64
 	var queried, fundedCount, underfundedCount int
@@ -68,18 +77,18 @@ func runInfoCmd(_ *cobra.Command, _ []string) {
 			continue
 		}
 
-		flag := ""
+		status := "ok"
 		if balance >= minPerSender {
 			fundedCount++
 		} else {
 			underfundedCount++
-			flag = " (underfunded)"
+			status = fmt.Sprintf("UNDERFUNDED (needs %d more)", minPerSender-balance)
 		}
-		fmt.Printf("%-12s %-20s %8d %15d%s\n", s.Name, holderID[:16]+"...", len(outs), balance, flag)
+		fmt.Printf("%-12s %-20s %8d %18d  %s\n", s.Name, holderID[:16]+"...", len(outs), balance, status)
 		totalBalance += balance
 		queried++
 	}
-	fmt.Printf("%-12s %-20s %8s %15d\n", "TOTAL", "", "", totalBalance)
+	fmt.Printf("%-12s %-20s %8s %18d\n", "TOTAL", "", "", totalBalance)
 
 	// General summary
 	numSenders := len(cfg.Senders)
@@ -92,18 +101,24 @@ func runInfoCmd(_ *cobra.Command, _ []string) {
 	fmt.Println()
 	fmt.Println("Summary")
 	fmt.Println("-------")
-	fmt.Printf("  senders configured:         %d\n", numSenders)
-	fmt.Printf("  total balance:              %d\n", totalBalance)
-	fmt.Printf("  average balance:            %d\n", avgBalance)
+	fmt.Printf("  senders configured:          %d\n", numSenders)
+	fmt.Printf("  total balance:               %d\n", totalBalance)
+	fmt.Printf("  average balance:             %d\n", avgBalance)
 	if seqCount > 0 {
-		fmt.Printf("  tag-along fee (max of %d):   %d\n", seqCount, tagAlongFee)
+		fmt.Printf("  tag-along fee (max of %d):    %d\n", seqCount, tagAlongFee)
 	} else {
-		fmt.Printf("  tag-along fee (assumed):    %d\n", tagAlongFee)
+		fmt.Printf("  tag-along fee (assumed):     %d\n", tagAlongFee)
 	}
-	fmt.Printf("  transfer amount:            %d\n", cfg.Global.TransferAmount)
-	fmt.Printf("  batch size:                 %d (max spend/round %d)\n", cfg.Global.BatchSize, cfg.PerRoundMaxSpend(tagAlongFee))
-	fmt.Printf("  min per sender to run:      %d  (2 x transfer + tag-along fee)\n", minPerSender)
-	fmt.Printf("  min total to fund all:      %d  (%d senders x %d)\n", minTotal, numSenders, minPerSender)
-	fmt.Printf("  funded enough:              %d\n", fundedCount)
-	fmt.Printf("  need additional funding:    %d\n", underfundedCount)
+	fmt.Printf("  transfer amount:             %d\n", cfg.Global.TransferAmount)
+	fmt.Printf("  batch size:                  %d\n", cfg.Global.BatchSize)
+	fmt.Printf("  sigLock storage deposit:     %d  (min per produced output)\n", minStorageDeposit)
+	fmt.Printf("  min funding per sender:      %d  (%d x transfer + fee + storage deposit)\n",
+		minPerSender, cfg.Global.BatchSize)
+	fmt.Printf("  min total to fund all:       %d  (%d senders x %d)\n", minTotal, numSenders, minPerSender)
+	fmt.Printf("  funded enough:               %d\n", fundedCount)
+	fmt.Printf("  need additional funding:     %d\n", underfundedCount)
+	if underfundedCount > 0 {
+		fmt.Printf("\n  WARNING: %d sender(s) underfunded — their transactions will be rejected by the node\n", underfundedCount)
+		fmt.Printf("           (dust remainder below the %d storage-deposit floor). Fund them before running.\n", minStorageDeposit)
+	}
 }

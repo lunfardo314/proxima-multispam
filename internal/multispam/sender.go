@@ -52,6 +52,10 @@ type Sender struct {
 	spentSet  map[base.OutputID]spentEntry
 	metrics   *SenderMetrics
 	logFunc   func(format string, args ...any)
+
+	// minStorageDeposit is the sigLock storage-deposit floor (computed once,
+	// wallet-side). A produced sigLock output below it makes the tx invalid.
+	minStorageDeposit uint64
 }
 
 // SenderMetrics holds per-sender counters, read atomically by the coordinator.
@@ -72,6 +76,9 @@ type SenderParams struct {
 	SeqPicker  *SequencerPicker
 	Targets    []base.HolderID
 	LogFunc    func(format string, args ...any)
+
+	// MinStorageDeposit is the sigLock storage-deposit floor (see Sender).
+	MinStorageDeposit uint64
 }
 
 func NewSender(par SenderParams) *Sender {
@@ -90,6 +97,8 @@ func NewSender(par SenderParams) *Sender {
 		spentSet:   make(map[base.OutputID]spentEntry),
 		metrics:    &SenderMetrics{},
 		logFunc:    par.LogFunc,
+
+		minStorageDeposit: par.MinStorageDeposit,
 	}
 }
 
@@ -169,8 +178,15 @@ func (s *Sender) doRound(pace int) bool {
 		return false
 	}
 
-	// Step 4: Check minimum balance
-	if availableBalance < s.cfg.MinBalanceToParticipate(seqInfo.Fee) {
+	// Step 4: Check minimum balance. A sender with funds below the floor for a
+	// single valid transfer cannot transact without producing a dust remainder
+	// (which the node silently rejects), so surface it as an error instead of
+	// idling silently. Senders with zero spendable outputs were already handled
+	// above and stay quiet.
+	minForOneTx := s.cfg.MinBalanceForOneTx(seqInfo.Fee, s.minStorageDeposit)
+	if availableBalance < minForOneTx {
+		s.log("UNDERFUNDED: spendable %d < minimum %d (transfer %d + fee %d + storage deposit %d) — fund this sender",
+			availableBalance, minForOneTx, s.cfg.Global.TransferAmount, seqInfo.Fee, s.minStorageDeposit)
 		return false
 	}
 
@@ -236,15 +252,22 @@ func (s *Sender) buildAndSubmitBatch(available []spendable, pace int, seqInfo Se
 			break
 		}
 
-		// Submit
-		err = clnt.SubmitTransaction(txBytes)
+		// Submit with the consumed UTXO bytes so the node runs full-context
+		// (stage-3) validation and returns the real reason on failure —
+		// otherwise an invalid non-seq tx is accepted and then silently
+		// dropped, which is impossible to diagnose from the spammer side.
+		consumed := make([][]byte, len(inputs))
+		for i, in := range inputs {
+			consumed[i] = in.bytes
+		}
+		_, err = clnt.SubmitTransactionWithDetail(txBytes, client.WithConsumedUTXOs(consumed))
 		if err != nil {
 			s.log("submit error: %v", err)
 			s.metrics.TxFailed.Add(1)
 			s.rotateHost()
 			// Retry with next host
 			clnt = s.client()
-			err = clnt.SubmitTransaction(txBytes)
+			_, err = clnt.SubmitTransactionWithDetail(txBytes, client.WithConsumedUTXOs(consumed))
 			if err != nil {
 				s.log("submit retry error: %v", err)
 				break
@@ -337,8 +360,17 @@ func (s *Sender) buildOneTx(inputs []spendable, pace int, seqInfo SequencerInfo,
 		txb.ProduceOutput(taOut.Bytes())
 	}
 
-	// Remainder output back to self (produced last).
+	// Remainder output back to self (produced last). A remainder that is
+	// non-zero but below the sigLock storage-deposit floor is a dust output:
+	// the node rejects the whole tx with "storage deposit not met" and (because
+	// it is an unsolicited non-seq tx) drops it silently, so the spam never
+	// settles. Refuse to build such a tx and report it instead.
 	remainderAmount := inTotal - transferAmount - tagAlongFee
+	if remainderAmount > 0 && remainderAmount < s.minStorageDeposit {
+		return nil, base.TransactionID{}, nil, fmt.Errorf(
+			"dust remainder %d below storage-deposit floor %d (inputs %d, transfer %d, fee %d) — would be rejected by the node",
+			remainderAmount, s.minStorageDeposit, inTotal, transferAmount, tagAlongFee)
+	}
 	var remBytes []byte
 	var remIdx byte
 	if remainderAmount > 0 {
