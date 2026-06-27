@@ -353,14 +353,35 @@ func (s *Sender) buildOneTx(inputs []spendable, pace int, seqInfo SequencerInfo,
 
 	ts := s.pickTimestamp(inTs, pace)
 
-	transferAmount := s.cfg.Global.TransferAmount
 	tagAlongFee := uint64(0)
 	if includeTagAlong {
 		tagAlongFee = seqInfo.Fee
 	}
 
-	if inTotal < transferAmount+tagAlongFee {
-		return nil, base.TransactionID{}, nil, fmt.Errorf("insufficient balance: have %d, need %d", inTotal, transferAmount+tagAlongFee)
+	// Decide the transfer amount and remainder so the transaction is always
+	// valid and the sender never stalls on an off-by-a-little balance (which
+	// breaks the batch loop and caps TPS). Constraints: the target sigLock
+	// output must clear the storage-deposit floor, and the remainder must be
+	// either zero or also clear the floor (a dust remainder makes the node
+	// reject the whole tx). Prefer the configured transfer amount when the
+	// leftover is a valid (>= floor) remainder; otherwise spend the whole input
+	// into the target with no remainder. Only a balance too small for even one
+	// floor-sized output plus the fee is a real "insufficient funds" case.
+	if inTotal < tagAlongFee+s.minStorageDeposit {
+		return nil, base.TransactionID{}, nil, fmt.Errorf(
+			"insufficient balance: have %d, need at least %d (fee %d + storage-deposit floor %d)",
+			inTotal, tagAlongFee+s.minStorageDeposit, tagAlongFee, s.minStorageDeposit)
+	}
+
+	transferAmount := s.cfg.Global.TransferAmount
+	remainderAmount := uint64(0)
+	if inTotal >= transferAmount+tagAlongFee+s.minStorageDeposit {
+		// Configured transfer leaves a remainder that still clears the floor.
+		remainderAmount = inTotal - transferAmount - tagAlongFee
+	} else {
+		// Not enough headroom for the configured transfer plus a valid
+		// remainder — spend the whole input into the target, no remainder.
+		transferAmount = inTotal - tagAlongFee
 	}
 
 	txb := txbuildercore.New(0)
@@ -394,17 +415,9 @@ func (s *Sender) buildOneTx(inputs []spendable, pace int, seqInfo SequencerInfo,
 		txb.ProduceOutput(taOut.Bytes())
 	}
 
-	// Remainder output back to self (produced last). A remainder that is
-	// non-zero but below the sigLock storage-deposit floor is a dust output:
-	// the node rejects the whole tx with "storage deposit not met" and (because
-	// it is an unsolicited non-seq tx) drops it silently, so the spam never
-	// settles. Refuse to build such a tx and report it instead.
-	remainderAmount := inTotal - transferAmount - tagAlongFee
-	if remainderAmount > 0 && remainderAmount < s.minStorageDeposit {
-		return nil, base.TransactionID{}, nil, fmt.Errorf(
-			"dust remainder %d below storage-deposit floor %d (inputs %d, transfer %d, fee %d) — would be rejected by the node",
-			remainderAmount, s.minStorageDeposit, inTotal, transferAmount, tagAlongFee)
-	}
+	// Remainder output back to self (produced last). remainderAmount was chosen
+	// above to be either zero or >= the storage-deposit floor, so it is never a
+	// dust output that the node would reject.
 	var remBytes []byte
 	var remIdx byte
 	if remainderAmount > 0 {
