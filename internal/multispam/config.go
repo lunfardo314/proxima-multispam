@@ -26,6 +26,7 @@ type GlobalConfig struct {
 	SequencerStrategy    string `yaml:"sequencer_strategy"`     // "next" (round-robin) or "random"
 	HostStrategy         string `yaml:"host_strategy"`          // "next" (round-robin) or "random"
 	MindRateControl      *bool  `yaml:"mind_rate_control"`      // default true: wait pace duration between rounds
+	TimestampJitterTicks *int   `yaml:"timestamp_jitter_ticks"` // random ticks added to each tx timestamp to spread them across the slot; nil=default (one slot), 0=off
 }
 
 type SenderConfig struct {
@@ -48,6 +49,9 @@ const (
 	DefaultSequencerStrategy    = "next"
 	DefaultHostStrategy         = "random"
 	DefaultHostTimeout          = 10 * time.Second
+	// DefaultTimestampJitterTicks spreads tx timestamps over roughly one slot
+	// so they don't cluster on the current clock tick / slot boundary.
+	DefaultTimestampJitterTicks = base.TicksPerSlot
 
 	StrategyS      = "self"
 	StrategyNext   = "next"
@@ -69,6 +73,16 @@ func LoadConfig(path string) (*Config, error) {
 
 func (cfg *Config) IsMindRateControl() bool {
 	return cfg.Global.MindRateControl == nil || *cfg.Global.MindRateControl
+}
+
+// JitterTicks returns the number of random ticks to add on top of each tx's
+// minimum (pace-respecting) timestamp. nil means use the default; 0 disables
+// jitter (timestamps then pin to the clock tick, as before).
+func (cfg *Config) JitterTicks() int {
+	if cfg.Global.TimestampJitterTicks == nil {
+		return DefaultTimestampJitterTicks
+	}
+	return *cfg.Global.TimestampJitterTicks
 }
 
 // MinBalanceForOneTx is the minimum spendable balance a sender needs to build a
@@ -190,6 +204,7 @@ func SenderHolderID(keyFile string) (string, error) {
 
 // GenerateDefaultConfig creates a config file with N senders and default values.
 func GenerateDefaultConfig(numSenders int, apiHost string, keyDir string) *Config {
+	jitter := DefaultTimestampJitterTicks
 	cfg := &Config{
 		APIHosts: []HostConfig{
 			{URL: apiHost, Timeout: DefaultHostTimeout},
@@ -201,6 +216,7 @@ func GenerateDefaultConfig(numSenders int, apiHost string, keyDir string) *Confi
 			TargetStrategy:       DefaultTargetStrategy,
 			SequencerStrategy:    DefaultSequencerStrategy,
 			HostStrategy:         DefaultHostStrategy,
+			TimestampJitterTicks: &jitter,
 		},
 		Senders: make([]SenderConfig, numSenders),
 	}

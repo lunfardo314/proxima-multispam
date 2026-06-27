@@ -302,6 +302,41 @@ func (s *Sender) buildAndSubmitBatch(available []spendable, pace int, seqInfo Se
 	return anySent
 }
 
+// maxFutureJitterTicks caps how far ahead of "now" a jittered timestamp may
+// land. The node delays a future-dated tx until the wall clock reaches its
+// ledger time (ledger time ≈ wall clock; it only rejects timestamps more than
+// ~6 slots ahead), so we keep jitter well inside that window.
+const maxFutureJitterTicks = 5 * base.TicksPerSlot
+
+// pickTimestamp chooses the timestamp for a new transaction. The lower bound is
+// max(maxInputTs + pace, now): it satisfies the non-sequencer pace invariant and
+// is never in the past relative to the clock. On top of that it adds a uniform
+// random jitter so timestamps spread across the slot instead of clustering on
+// the current clock tick / slot boundary — without jitter every caught-up tx is
+// pinned to the same "now" tick, and chained txs step by exactly the pace, so
+// transactions bunch up on a fixed grid (notably slot boundaries). The node
+// delays a future-dated tx until the clock catches up, so the jitter is safe;
+// it is clamped to stay within the node's future-acceptance window.
+func (s *Sender) pickTimestamp(inTs base.LedgerTime, pace int) base.LedgerTime {
+	lower := inTs.AddTicks(pace)
+	now := s.constants.LedgerTimeFromClockTime(time.Now())
+	if lower.Before(now) {
+		lower = now
+	}
+	jitter := s.cfg.JitterTicks()
+	if jitter <= 0 {
+		return lower
+	}
+	room := int(base.DiffTicks(now.AddTicks(maxFutureJitterTicks), lower))
+	if room <= 0 {
+		return lower
+	}
+	if jitter > room {
+		jitter = room
+	}
+	return lower.AddTicks(rand.Intn(jitter + 1))
+}
+
 // buildOneTx constructs a single transfer transaction with the raw
 // wasm-wallet composer (txbuildercore + the wallet library). No ledger
 // singleton: produced outputs are composed via txbuildercore helpers and
@@ -316,13 +351,7 @@ func (s *Sender) buildOneTx(inputs []spendable, pace int, seqInfo SequencerInfo,
 		inTs = base.MaximumTime(inTs, in.id.Timestamp())
 	}
 
-	// Timestamp: max input ts + pace, but never before "now". Both
-	// branches keep the pace invariant, so the node accepts the tx.
-	ts := inTs.AddTicks(pace)
-	now := s.constants.LedgerTimeFromClockTime(time.Now())
-	if ts.Before(now) {
-		ts = now
-	}
+	ts := s.pickTimestamp(inTs, pace)
 
 	transferAmount := s.cfg.Global.TransferAmount
 	tagAlongFee := uint64(0)
