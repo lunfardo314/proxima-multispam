@@ -45,6 +45,7 @@ All multispam commands live under `proxi multispam ...`:
 
 - `proxi multispam run` — run multi-spammer with K senders
 - `proxi multispam fund` — fund all (or selected) accounts from wallet
+- `proxi multispam withdraw` — sweep all (or selected) sender balances back into the wallet
 - `proxi multispam info` — display account balances and status
 - `proxi multispam init` - generates N keys, creates `multispam.yaml` config file with default values 
 
@@ -170,6 +171,37 @@ proxi multispam fund --amount <tokens> [--sender <name>] [--config multispam.yam
    - Submit and wait for inclusion in LRB
    - Use remainder from previous tx as input for next (chain funding txs)
 4. Display final balances
+
+## Withdraw Command (`proxi multispam withdraw`)
+
+The reverse of `fund`: instead of the wallet paying out to senders, each sender
+pays its whole balance back to the wallet. Reads `multispam.yaml` and the
+standard `proxi.yaml` wallet config (the wallet is the sweep target).
+
+```
+proxi multispam withdraw [--senders <name>,...] [--config multispam.yaml]
+```
+
+1. Load the wallet holder ID from `proxi.yaml` (the sweep destination)
+2. Load sender list from `multispam.yaml` (or the subset named by `--senders`)
+3. For each sender:
+   - Query its LRB outputs and balance
+   - Skip if the balance is zero
+   - Skip if the balance is too small to produce a single valid output — i.e.
+     `balance - tag_along_fee` must clear the sigLock storage-deposit floor
+   - Build one transaction consuming **all** of the sender's UTXOs and producing
+     a **single** sigLock output to the wallet carrying `balance - tag_along_fee`,
+     plus a tag-along output paying the sequencer
+   - Log the sender's data (UTXO count, balance, amount withdrawn, fee, txid)
+   - Submit the transaction; **do not** wait for confirmation
+4. Print a summary (`swept / skipped / failed / total tokens`)
+
+Notes:
+- A single tx caps at 256 elements; withdraw produces two outputs, so it consumes
+  at most 254 UTXOs per sender. A sender holding more keeps a small remainder that
+  a second `withdraw` run sweeps.
+- Because it does not wait for inclusion, run `proxi multispam info` after finality
+  to confirm every swept sender reached a zero balance.
 
 ## Info Command (`proxi multispam info`)
 

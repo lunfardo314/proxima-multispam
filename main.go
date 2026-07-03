@@ -26,6 +26,7 @@ func main() {
 		initInitCmd(),
 		initInfoCmd(),
 		initFundCmd(),
+		initWithdrawCmd(),
 		initRunCmd(),
 	)
 

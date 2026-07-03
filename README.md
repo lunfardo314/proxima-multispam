@@ -17,10 +17,11 @@ go build -o multispam .
 ## Commands
 
 ```
-multispam init    # generate sender keys + multispam.yaml
-multispam fund    # fund senders from a configured wallet
-multispam info    # show sender balances
-multispam run     # start the spammer
+multispam init      # generate sender keys + multispam.yaml
+multispam fund      # fund senders from a configured wallet
+multispam info      # show sender balances
+multispam withdraw  # sweep all sender balances back into the wallet
+multispam run       # start the spammer
 ```
 
 See [docs/multispam.md](docs/multispam.md) for the full design and config
