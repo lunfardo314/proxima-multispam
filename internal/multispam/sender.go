@@ -49,18 +49,8 @@ type Sender struct {
 	hostIdx   int
 	seqPicker *SequencerPicker
 	targets   []base.HolderID // all sender holder IDs for target strategies
-	// peerBalances is the per-sender last-known balance, index-aligned with `targets`
-	// (shared, read atomically). Used by the "rebalance" target strategy to steer each
-	// transfer toward a below-average sender so the spam traffic itself keeps the fund
-	// distribution even — no separate rebalance pass. Wired by the coordinator after all
-	// senders exist; nil until then (rebalance falls back to random).
-	peerBalances []*SenderMetrics
-	// lastFanoutSlot throttles rich-sender fan-out funding to once per
-	// RebalanceIntervalSlots, so funding finalizes and balances re-read before the next
-	// fan-out decision (else stale balances re-fund the same accounts and re-condense).
-	lastFanoutSlot uint32
-	spentSet       map[base.OutputID]spentEntry
-	metrics        *SenderMetrics
+	spentSet  map[base.OutputID]spentEntry
+	metrics   *SenderMetrics
 	logFunc   func(format string, args ...any)
 	verbose   bool
 
@@ -117,10 +107,6 @@ func NewSender(par SenderParams) *Sender {
 
 func (s *Sender) Metrics() *SenderMetrics { return s.metrics }
 func (s *Sender) Name() string            { return s.name }
-
-// SetPeerBalances wires the shared per-sender balance view (index-aligned with the
-// target list) used by the "rebalance" target strategy.
-func (s *Sender) SetPeerBalances(peers []*SenderMetrics) { s.peerBalances = peers }
 
 // Run is the main sender loop. Blocks until context is cancelled.
 func (s *Sender) Run(ctx context.Context) {
@@ -193,16 +179,6 @@ func (s *Sender) doRound(pace int) bool {
 	if !ok {
 		s.log("no sequencers available")
 		return false
-	}
-
-	// Step 3.5 (rebalance mode): if this sender is rich and starving accounts exist,
-	// fund as many of them as its balance allows in ONE fan-out transaction. This
-	// redistributes far faster than the per-round batch of single small transfers,
-	// which cannot drain a large account or lift the frozen ones quickly enough.
-	if s.cfg.Global.TargetStrategy == StrategyRebalance {
-		if s.tryFanoutFunding(available, availableBalance, currentSlot, seqInfo, clnt) {
-			return true
-		}
 	}
 
 	// Step 4: Check minimum balance. A sender with funds below the floor for a
@@ -399,26 +375,12 @@ func (s *Sender) buildOneTx(inputs []spendable, pace int, seqInfo SequencerInfo,
 
 	transferAmount := s.cfg.Global.TransferAmount
 	remainderAmount := uint64(0)
-	target := s.resolveTarget()
-	switch {
-	case inTotal >= transferAmount+tagAlongFee+s.minStorageDeposit:
-		// Enough for the configured transfer plus a valid (>= floor) remainder to self.
+	if inTotal >= transferAmount+tagAlongFee+s.minStorageDeposit {
+		// Configured transfer leaves a remainder that still clears the floor.
 		remainderAmount = inTotal - transferAmount - tagAlongFee
-	case inTotal >= 2*s.minStorageDeposit+tagAlongFee:
-		// Not enough for the configured transfer, but enough to split into two
-		// floor-clearing outputs. Shrink the transfer so a floor-sized remainder stays
-		// with the SENDER instead of dumping the whole balance into the target. This is
-		// what keeps every account alive and spendable each round (never drained to
-		// zero), so it can be topped back up by rebalancing — sustaining TPS with a
-		// fixed pool. (Emptying into the target was the ebaab19 coalescence regression.)
-		transferAmount = inTotal - tagAlongFee - s.minStorageDeposit
-		remainderAmount = s.minStorageDeposit
-	default:
-		// Too small to split into two floor-clearing outputs (inTotal in
-		// [fee+floor, 2*floor+fee)). Churn the whole input back to SELF as one output
-		// (no cross-account transfer): still a valid, fee-paying tx that keeps TPS up
-		// and the funds with the sender rather than emptying them downstream.
-		target = s.holderID
+	} else {
+		// Not enough headroom for the configured transfer plus a valid
+		// remainder — spend the whole input into the target, no remainder.
 		transferAmount = inTotal - tagAlongFee
 	}
 
@@ -438,7 +400,7 @@ func (s *Sender) buildOneTx(inputs []spendable, pace int, seqInfo SequencerInfo,
 	}
 
 	// Target output (sigLock to the resolved holder).
-	targetOut, err := txbuildercore.NewSigLockOutput(s.lib, transferAmount, target)
+	targetOut, err := txbuildercore.NewSigLockOutput(s.lib, transferAmount, s.resolveTarget())
 	if err != nil {
 		return nil, base.TransactionID{}, nil, fmt.Errorf("target output: %w", err)
 	}
@@ -498,183 +460,9 @@ func (s *Sender) resolveTarget() base.HolderID {
 		return s.targets[nextIdx]
 	case StrategyRandom:
 		return s.targets[rand.Intn(len(s.targets))]
-	case StrategyRebalance:
-		return s.pickRebalanceTarget()
 	default: // "self"
 		return s.holderID
 	}
-}
-
-// pickRebalanceTarget returns a random sender whose last-known balance is below the
-// fleet average (excluding self), so every transfer flows toward the underfunded end
-// and the distribution stays even without a separate rebalance pass. Falls back to a
-// uniform-random target when balances are not yet known or none is below average.
-func (s *Sender) pickRebalanceTarget() base.HolderID {
-	if len(s.peerBalances) != len(s.targets) {
-		return s.targets[rand.Intn(len(s.targets))]
-	}
-	var total uint64
-	for _, m := range s.peerBalances {
-		total += m.LastBalance.Load()
-	}
-	avg := total / uint64(len(s.peerBalances))
-
-	below := make([]int, 0, len(s.targets))
-	for i, m := range s.peerBalances {
-		if i == s.index {
-			continue // never target self
-		}
-		if m.LastBalance.Load() < avg {
-			below = append(below, i)
-		}
-	}
-	if len(below) == 0 {
-		return s.targets[rand.Intn(len(s.targets))]
-	}
-	return s.targets[below[rand.Intn(len(below))]]
-}
-
-// maxFanoutTargets caps the number of funding outputs in one fan-out tx, well under
-// the 256-output protocol limit (leaving room for the tag-along and remainder outputs).
-const maxFanoutTargets = 200
-
-// tryFanoutFunding, in rebalance mode, lets a rich sender lift many starving accounts
-// (below the one-tx send floor) above it in a SINGLE transaction: it produces one
-// funding output per starving account — as many as its balance allows — plus a
-// remainder that keeps the sender itself active. Returns true if it built and submitted
-// such a tx; false (fall through to normal spam) when the sender is not rich enough or
-// no accounts are starving. Requires the shared peer-balance view.
-func (s *Sender) tryFanoutFunding(available []spendable, availableBalance uint64, currentSlot uint32, seqInfo SequencerInfo, clnt *client.APIClient) bool {
-	if len(s.peerBalances) != len(s.targets) {
-		return false
-	}
-	// Throttle: at most one fan-out per RebalanceIntervalSlots, so the previous funding
-	// finalizes in the LRB and balances re-read before we decide who is still starving.
-	if s.lastFanoutSlot != 0 && currentSlot-s.lastFanoutSlot < uint32(s.cfg.Global.RebalanceIntervalSlots) {
-		return false
-	}
-	// Fund each starving account enough to run a full batch (become fully active);
-	// keep the same amount with self so this sender stays active too.
-	fundAmount := s.cfg.MinFundingPerSender(seqInfo.Fee, s.minStorageDeposit)
-	starvingThreshold := s.cfg.MinBalanceForOneTx(seqInfo.Fee, s.minStorageDeposit)
-	selfKeep := fundAmount
-
-	// Not rich enough to fund even one starving account while staying active itself.
-	if availableBalance < selfKeep+seqInfo.Fee+fundAmount {
-		return false
-	}
-
-	// Starving targets (below the one-tx send floor), neediest first.
-	starving := make([]int, 0, len(s.peerBalances))
-	for i, m := range s.peerBalances {
-		if i == s.index {
-			continue
-		}
-		if m.LastBalance.Load() < starvingThreshold {
-			starving = append(starving, i)
-		}
-	}
-	if len(starving) == 0 {
-		return false
-	}
-	// Shuffle so concurrent rich senders fund different subsets of the starving set
-	// (rather than all piling onto the same neediest few) — maximizes coverage per round.
-	rand.Shuffle(len(starving), func(a, b int) { starving[a], starving[b] = starving[b], starving[a] })
-
-	// How many we can fund: bounded by surplus balance, starving count and output cap.
-	n := int((availableBalance - selfKeep - seqInfo.Fee) / fundAmount)
-	if n > len(starving) {
-		n = len(starving)
-	}
-	if n > maxFanoutTargets {
-		n = maxFanoutTargets
-	}
-	if n <= 0 {
-		return false
-	}
-
-	txBytes, txID, err := s.buildFanoutTx(available, starving[:n], fundAmount, seqInfo)
-	if err != nil {
-		s.log("fanout build error: %v", err)
-		s.metrics.TxFailed.Add(1)
-		return false
-	}
-	consumed := make([][]byte, len(available))
-	for i, in := range available {
-		consumed[i] = in.bytes
-	}
-	if _, err := clnt.SubmitTransactionWithDetail(txBytes, client.WithConsumedUTXOs(consumed)); err != nil {
-		s.log("fanout submit error: %v", err)
-		s.metrics.TxFailed.Add(1)
-		s.rotateHost()
-		return false
-	}
-	submittedSlot := txID.Timestamp().Slot
-	for _, in := range available {
-		s.spentSet[in.id] = spentEntry{TxID: txID, SubmittedSlot: submittedSlot}
-	}
-	s.metrics.TxSent.Add(1)
-	s.nextHost()
-	s.lastFanoutSlot = currentSlot
-	if s.verbose {
-		s.log("fanout: funded %d starving account(s) with %d each", n, fundAmount)
-	}
-	return true
-}
-
-// buildFanoutTx consumes all of the sender's inputs and produces one fundAmount output
-// to each target, a tag-along output, and a remainder back to self. The caller guarantees
-// the remainder clears the storage-deposit floor.
-func (s *Sender) buildFanoutTx(inputs []spendable, targetIdx []int, fundAmount uint64, seqInfo SequencerInfo) ([]byte, base.TransactionID, error) {
-	var inTotal uint64
-	inTs := base.NilLedgerTime
-	for _, in := range inputs {
-		inTotal += in.amount
-		inTs = base.MaximumTime(inTs, in.id.Timestamp())
-	}
-	ts := s.pickTimestamp(inTs, int(s.constants.TransactionPace))
-
-	tagAlongFee := seqInfo.Fee
-	remainderAmount := inTotal - fundAmount*uint64(len(targetIdx)) - tagAlongFee
-
-	txb := txbuildercore.New(0)
-	for i, in := range inputs {
-		txb.ConsumeOutput(in.bytes, in.id)
-		if i == 0 {
-			txb.PutSignatureUnlock(0)
-		} else {
-			if err := txb.PutUnlockReference(byte(i), txbuildercore.ConstraintIndexLock, 0); err != nil {
-				return nil, base.TransactionID{}, err
-			}
-		}
-	}
-	for _, ti := range targetIdx {
-		out, err := txbuildercore.NewSigLockOutput(s.lib, fundAmount, s.targets[ti])
-		if err != nil {
-			return nil, base.TransactionID{}, fmt.Errorf("fanout output: %w", err)
-		}
-		txb.ProduceOutput(out.Bytes())
-	}
-	taOut, err := txbuildercore.NewTagAlongOutput(s.lib, tagAlongFee, seqInfo.ChainID, s.holderID)
-	if err != nil {
-		return nil, base.TransactionID{}, fmt.Errorf("tag-along output: %w", err)
-	}
-	txb.ProduceOutput(taOut.Bytes())
-	remOut, err := txbuildercore.NewSigLockOutput(s.lib, remainderAmount, s.holderID)
-	if err != nil {
-		return nil, base.TransactionID{}, fmt.Errorf("remainder output: %w", err)
-	}
-	txb.ProduceOutput(remOut.Bytes())
-
-	txb.SetTimestamp(ts)
-	txb.ComputeInputCommitment()
-	txb.SignED25519(s.privateKey)
-	txBytes := txb.Bytes()
-	txID, err := txbuildercore.TxIDFromBytes(txBytes)
-	if err != nil {
-		return nil, base.TransactionID{}, fmt.Errorf("txid: %w", err)
-	}
-	return txBytes, txID, nil
 }
 
 func (s *Sender) client() *client.APIClient {

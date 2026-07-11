@@ -25,11 +25,6 @@ type GlobalConfig struct {
 	TargetStrategy       string `yaml:"target_strategy"`
 	SequencerStrategy    string `yaml:"sequencer_strategy"`     // "next" (round-robin) or "random"
 	HostStrategy         string `yaml:"host_strategy"`          // "next" (round-robin) or "random"
-	// RebalanceIntervalSlots throttles the rich-sender fan-out funding (rebalance mode):
-	// a sender does at most one fan-out every this many slots. Fan-out funding lands in
-	// the LRB only after finalization, so re-funding every round acts on stale balances
-	// and re-condenses; spacing it lets balances settle before the next decision.
-	RebalanceIntervalSlots int `yaml:"rebalance_interval_slots"`
 	MindRateControl      *bool  `yaml:"mind_rate_control"`      // default true: wait pace duration between rounds
 	TimestampJitterTicks *int   `yaml:"timestamp_jitter_ticks"` // random ticks added to each tx timestamp to spread them across the slot; nil=default (one slot), 0=off
 }
@@ -50,10 +45,6 @@ const (
 	DefaultTransferAmount      = 100_000_000
 	DefaultFinalityTimeoutSlots = 3
 	DefaultBatchSize           = 1
-	// DefaultRebalanceIntervalSlots spaces fan-out funding so balances finalize in the
-	// LRB between decisions (finality is a few slots); re-funding every round on stale
-	// balances re-condenses the distribution.
-	DefaultRebalanceIntervalSlots = 5
 	DefaultTargetStrategy       = "self"
 	DefaultSequencerStrategy    = "next"
 	DefaultHostStrategy         = "random"
@@ -62,10 +53,9 @@ const (
 	// so they don't cluster on the current clock tick / slot boundary.
 	DefaultTimestampJitterTicks = base.TicksPerSlot
 
-	StrategyS         = "self"
-	StrategyNext      = "next"
-	StrategyRandom    = "random"
-	StrategyRebalance = "rebalance" // target a below-average sender so spam traffic evens the distribution
+	StrategyS      = "self"
+	StrategyNext   = "next"
+	StrategyRandom = "random"
 )
 
 func LoadConfig(path string) (*Config, error) {
@@ -125,9 +115,6 @@ func (cfg *Config) applyDefaults() {
 	if cfg.Global.BatchSize <= 0 {
 		cfg.Global.BatchSize = DefaultBatchSize
 	}
-	if cfg.Global.RebalanceIntervalSlots <= 0 {
-		cfg.Global.RebalanceIntervalSlots = DefaultRebalanceIntervalSlots
-	}
 	if cfg.Global.TargetStrategy == "" {
 		cfg.Global.TargetStrategy = DefaultTargetStrategy
 	}
@@ -152,9 +139,9 @@ func (cfg *Config) validate() error {
 		return fmt.Errorf("at least 2 senders required, got %d", len(cfg.Senders))
 	}
 	switch cfg.Global.TargetStrategy {
-	case StrategyS, StrategyNext, StrategyRandom, StrategyRebalance:
+	case StrategyS, StrategyNext, StrategyRandom:
 	default:
-		return fmt.Errorf("unknown target_strategy: '%s' (expected self, next, random, rebalance)", cfg.Global.TargetStrategy)
+		return fmt.Errorf("unknown target_strategy: '%s' (expected self, next, random)", cfg.Global.TargetStrategy)
 	}
 	switch cfg.Global.SequencerStrategy {
 	case StrategyNext, StrategyRandom:
