@@ -55,8 +55,12 @@ type Sender struct {
 	// distribution even — no separate rebalance pass. Wired by the coordinator after all
 	// senders exist; nil until then (rebalance falls back to random).
 	peerBalances []*SenderMetrics
-	spentSet     map[base.OutputID]spentEntry
-	metrics      *SenderMetrics
+	// lastFanoutSlot throttles rich-sender fan-out funding to once per
+	// RebalanceIntervalSlots, so funding finalizes and balances re-read before the next
+	// fan-out decision (else stale balances re-fund the same accounts and re-condense).
+	lastFanoutSlot uint32
+	spentSet       map[base.OutputID]spentEntry
+	metrics        *SenderMetrics
 	logFunc   func(format string, args ...any)
 	verbose   bool
 
@@ -196,7 +200,7 @@ func (s *Sender) doRound(pace int) bool {
 	// redistributes far faster than the per-round batch of single small transfers,
 	// which cannot drain a large account or lift the frozen ones quickly enough.
 	if s.cfg.Global.TargetStrategy == StrategyRebalance {
-		if s.tryFanoutFunding(available, availableBalance, seqInfo, clnt) {
+		if s.tryFanoutFunding(available, availableBalance, currentSlot, seqInfo, clnt) {
 			return true
 		}
 	}
@@ -540,8 +544,13 @@ const maxFanoutTargets = 200
 // remainder that keeps the sender itself active. Returns true if it built and submitted
 // such a tx; false (fall through to normal spam) when the sender is not rich enough or
 // no accounts are starving. Requires the shared peer-balance view.
-func (s *Sender) tryFanoutFunding(available []spendable, availableBalance uint64, seqInfo SequencerInfo, clnt *client.APIClient) bool {
+func (s *Sender) tryFanoutFunding(available []spendable, availableBalance uint64, currentSlot uint32, seqInfo SequencerInfo, clnt *client.APIClient) bool {
 	if len(s.peerBalances) != len(s.targets) {
+		return false
+	}
+	// Throttle: at most one fan-out per RebalanceIntervalSlots, so the previous funding
+	// finalizes in the LRB and balances re-read before we decide who is still starving.
+	if s.lastFanoutSlot != 0 && currentSlot-s.lastFanoutSlot < uint32(s.cfg.Global.RebalanceIntervalSlots) {
 		return false
 	}
 	// Fund each starving account enough to run a full batch (become fully active);
@@ -606,6 +615,7 @@ func (s *Sender) tryFanoutFunding(available []spendable, availableBalance uint64
 	}
 	s.metrics.TxSent.Add(1)
 	s.nextHost()
+	s.lastFanoutSlot = currentSlot
 	if s.verbose {
 		s.log("fanout: funded %d starving account(s) with %d each", n, fundAmount)
 	}
