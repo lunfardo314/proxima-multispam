@@ -93,6 +93,16 @@ func NewCoordinator(par CoordinatorParams) (*Coordinator, error) {
 		})
 	}
 
+	// Share the per-sender balance view (index-aligned with the holder-ID target list)
+	// so the "rebalance" target strategy can steer transfers toward below-average senders.
+	peerBalances := make([]*SenderMetrics, numSenders)
+	for i, sndr := range senders {
+		peerBalances[i] = sndr.Metrics()
+	}
+	for _, sndr := range senders {
+		sndr.SetPeerBalances(peerBalances)
+	}
+
 	return &Coordinator{
 		cfg:             cfg,
 		senders:         senders,

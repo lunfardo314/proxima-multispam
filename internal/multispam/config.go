@@ -53,9 +53,10 @@ const (
 	// so they don't cluster on the current clock tick / slot boundary.
 	DefaultTimestampJitterTicks = base.TicksPerSlot
 
-	StrategyS      = "self"
-	StrategyNext   = "next"
-	StrategyRandom = "random"
+	StrategyS         = "self"
+	StrategyNext      = "next"
+	StrategyRandom    = "random"
+	StrategyRebalance = "rebalance" // target a below-average sender so spam traffic evens the distribution
 )
 
 func LoadConfig(path string) (*Config, error) {
@@ -139,9 +140,9 @@ func (cfg *Config) validate() error {
 		return fmt.Errorf("at least 2 senders required, got %d", len(cfg.Senders))
 	}
 	switch cfg.Global.TargetStrategy {
-	case StrategyS, StrategyNext, StrategyRandom:
+	case StrategyS, StrategyNext, StrategyRandom, StrategyRebalance:
 	default:
-		return fmt.Errorf("unknown target_strategy: '%s' (expected self, next, random)", cfg.Global.TargetStrategy)
+		return fmt.Errorf("unknown target_strategy: '%s' (expected self, next, random, rebalance)", cfg.Global.TargetStrategy)
 	}
 	switch cfg.Global.SequencerStrategy {
 	case StrategyNext, StrategyRandom:

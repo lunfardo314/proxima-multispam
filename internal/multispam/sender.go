@@ -49,8 +49,14 @@ type Sender struct {
 	hostIdx   int
 	seqPicker *SequencerPicker
 	targets   []base.HolderID // all sender holder IDs for target strategies
-	spentSet  map[base.OutputID]spentEntry
-	metrics   *SenderMetrics
+	// peerBalances is the per-sender last-known balance, index-aligned with `targets`
+	// (shared, read atomically). Used by the "rebalance" target strategy to steer each
+	// transfer toward a below-average sender so the spam traffic itself keeps the fund
+	// distribution even — no separate rebalance pass. Wired by the coordinator after all
+	// senders exist; nil until then (rebalance falls back to random).
+	peerBalances []*SenderMetrics
+	spentSet     map[base.OutputID]spentEntry
+	metrics      *SenderMetrics
 	logFunc   func(format string, args ...any)
 	verbose   bool
 
@@ -107,6 +113,10 @@ func NewSender(par SenderParams) *Sender {
 
 func (s *Sender) Metrics() *SenderMetrics { return s.metrics }
 func (s *Sender) Name() string            { return s.name }
+
+// SetPeerBalances wires the shared per-sender balance view (index-aligned with the
+// target list) used by the "rebalance" target strategy.
+func (s *Sender) SetPeerBalances(peers []*SenderMetrics) { s.peerBalances = peers }
 
 // Run is the main sender loop. Blocks until context is cancelled.
 func (s *Sender) Run(ctx context.Context) {
@@ -375,12 +385,26 @@ func (s *Sender) buildOneTx(inputs []spendable, pace int, seqInfo SequencerInfo,
 
 	transferAmount := s.cfg.Global.TransferAmount
 	remainderAmount := uint64(0)
-	if inTotal >= transferAmount+tagAlongFee+s.minStorageDeposit {
-		// Configured transfer leaves a remainder that still clears the floor.
+	target := s.resolveTarget()
+	switch {
+	case inTotal >= transferAmount+tagAlongFee+s.minStorageDeposit:
+		// Enough for the configured transfer plus a valid (>= floor) remainder to self.
 		remainderAmount = inTotal - transferAmount - tagAlongFee
-	} else {
-		// Not enough headroom for the configured transfer plus a valid
-		// remainder — spend the whole input into the target, no remainder.
+	case inTotal >= 2*s.minStorageDeposit+tagAlongFee:
+		// Not enough for the configured transfer, but enough to split into two
+		// floor-clearing outputs. Shrink the transfer so a floor-sized remainder stays
+		// with the SENDER instead of dumping the whole balance into the target. This is
+		// what keeps every account alive and spendable each round (never drained to
+		// zero), so it can be topped back up by rebalancing — sustaining TPS with a
+		// fixed pool. (Emptying into the target was the ebaab19 coalescence regression.)
+		transferAmount = inTotal - tagAlongFee - s.minStorageDeposit
+		remainderAmount = s.minStorageDeposit
+	default:
+		// Too small to split into two floor-clearing outputs (inTotal in
+		// [fee+floor, 2*floor+fee)). Churn the whole input back to SELF as one output
+		// (no cross-account transfer): still a valid, fee-paying tx that keeps TPS up
+		// and the funds with the sender rather than emptying them downstream.
+		target = s.holderID
 		transferAmount = inTotal - tagAlongFee
 	}
 
@@ -400,7 +424,7 @@ func (s *Sender) buildOneTx(inputs []spendable, pace int, seqInfo SequencerInfo,
 	}
 
 	// Target output (sigLock to the resolved holder).
-	targetOut, err := txbuildercore.NewSigLockOutput(s.lib, transferAmount, s.resolveTarget())
+	targetOut, err := txbuildercore.NewSigLockOutput(s.lib, transferAmount, target)
 	if err != nil {
 		return nil, base.TransactionID{}, nil, fmt.Errorf("target output: %w", err)
 	}
@@ -460,9 +484,40 @@ func (s *Sender) resolveTarget() base.HolderID {
 		return s.targets[nextIdx]
 	case StrategyRandom:
 		return s.targets[rand.Intn(len(s.targets))]
+	case StrategyRebalance:
+		return s.pickRebalanceTarget()
 	default: // "self"
 		return s.holderID
 	}
+}
+
+// pickRebalanceTarget returns a random sender whose last-known balance is below the
+// fleet average (excluding self), so every transfer flows toward the underfunded end
+// and the distribution stays even without a separate rebalance pass. Falls back to a
+// uniform-random target when balances are not yet known or none is below average.
+func (s *Sender) pickRebalanceTarget() base.HolderID {
+	if len(s.peerBalances) != len(s.targets) {
+		return s.targets[rand.Intn(len(s.targets))]
+	}
+	var total uint64
+	for _, m := range s.peerBalances {
+		total += m.LastBalance.Load()
+	}
+	avg := total / uint64(len(s.peerBalances))
+
+	below := make([]int, 0, len(s.targets))
+	for i, m := range s.peerBalances {
+		if i == s.index {
+			continue // never target self
+		}
+		if m.LastBalance.Load() < avg {
+			below = append(below, i)
+		}
+	}
+	if len(below) == 0 {
+		return s.targets[rand.Intn(len(s.targets))]
+	}
+	return s.targets[below[rand.Intn(len(below))]]
 }
 
 func (s *Sender) client() *client.APIClient {
