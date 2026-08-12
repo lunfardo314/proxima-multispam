@@ -22,6 +22,7 @@ multispam fund      # fund senders from a configured wallet
 multispam info      # show sender balances
 multispam withdraw  # sweep all sender balances back into the wallet
 multispam run       # start the spammer
+multispam conflict  # spam sets of conflicting transactions, one per sequencer
 ```
 
 See [docs/multispam.md](docs/multispam.md) for the full design and config

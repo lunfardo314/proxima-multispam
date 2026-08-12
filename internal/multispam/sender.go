@@ -57,13 +57,20 @@ type Sender struct {
 	// minStorageDeposit is the sigLock storage-deposit floor (computed once,
 	// wallet-side). A produced sigLock output below it makes the tx invalid.
 	minStorageDeposit uint64
+
+	// conflict mode: every round spends the batch as a set of mutually conflicting
+	// transactions instead of a chain. conflictFanout overrides batch_size as the size of
+	// the set; 0 means take batch_size.
+	conflict       bool
+	conflictFanout int
 }
 
 // SenderMetrics holds per-sender counters, read atomically by the coordinator.
 type SenderMetrics struct {
-	TxSent      atomic.Int64
-	TxFailed    atomic.Int64
-	LastBalance atomic.Uint64
+	TxSent       atomic.Int64
+	TxFailed     atomic.Int64
+	LastBalance  atomic.Uint64
+	ConflictSets atomic.Int64
 }
 
 // SenderParams holds everything needed to create a Sender.
@@ -81,6 +88,10 @@ type SenderParams struct {
 
 	// MinStorageDeposit is the sigLock storage-deposit floor (see Sender).
 	MinStorageDeposit uint64
+
+	// Conflict and ConflictFanout select and size conflict mode (see Sender).
+	Conflict       bool
+	ConflictFanout int
 }
 
 func NewSender(par SenderParams) *Sender {
@@ -102,6 +113,8 @@ func NewSender(par SenderParams) *Sender {
 		verbose:    par.Verbose,
 
 		minStorageDeposit: par.MinStorageDeposit,
+		conflict:          par.Conflict,
+		conflictFanout:    par.ConflictFanout,
 	}
 }
 
@@ -111,7 +124,6 @@ func (s *Sender) Name() string            { return s.name }
 // Run is the main sender loop. Blocks until context is cancelled.
 func (s *Sender) Run(ctx context.Context) {
 	pace := int(s.constants.TransactionPace)
-	paceDuration := time.Duration(pace) * s.constants.TickDuration
 	mindRateControl := s.cfg.IsMindRateControl()
 
 	for {
@@ -121,21 +133,27 @@ func (s *Sender) Run(ctx context.Context) {
 		default:
 		}
 
-		sent := s.doRound(pace)
-		if !sent || mindRateControl {
-			// Wait pace duration: either nothing to spend, or respecting rate control
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(paceDuration):
-			}
+		sent, waitTicks := s.doRound(pace)
+		if sent && waitTicks == 0 && !mindRateControl {
+			continue
+		}
+		if waitTicks <= 0 {
+			// nothing to spend, or rate control asked for the plain pace
+			waitTicks = pace
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Duration(waitTicks) * s.constants.TickDuration):
 		}
 	}
 }
 
 // doRound performs one iteration: query outputs, classify, build and submit.
-// Returns true if at least one transaction was submitted.
-func (s *Sender) doRound(pace int) bool {
+// Returns whether anything was submitted, and how many ledger ticks to wait before the next
+// round. The wait is zero unless the round itself dictates one — a conflict set reserves a
+// stretch of this holder's timeline and the next round must start after it.
+func (s *Sender) doRound(pace int) (bool, int) {
 	clnt := s.client()
 
 	// Step 1: Query LRB outputs
@@ -143,7 +161,7 @@ func (s *Sender) doRound(pace int) bool {
 	if err != nil {
 		s.log("error fetching outputs: %v", err)
 		s.rotateHost()
-		return false
+		return false, 0
 	}
 
 	s.metrics.LastBalance.Store(totalBalance)
@@ -171,14 +189,15 @@ func (s *Sender) doRound(pace int) bool {
 	}
 
 	if len(available) == 0 {
-		return false
+		return false, 0
 	}
 
-	// Step 3: Get sequencer for tag-along
-	seqInfo, ok := s.seqPicker.Next()
-	if !ok {
+	// Step 3: Get sequencer(s) for tag-along. A chained batch pays a single fee, on its last
+	// transaction; a conflict set pays one per member, each to a different sequencer.
+	seqs := s.pickSequencers()
+	if len(seqs) == 0 {
 		s.log("no sequencers available")
-		return false
+		return false, 0
 	}
 
 	// Step 4: Check minimum balance. A sender with funds below the floor for a
@@ -186,17 +205,52 @@ func (s *Sender) doRound(pace int) bool {
 	// (which the node silently rejects). This is expected while waiting for
 	// funding to arrive, so only surface it under -v to avoid noise. Senders
 	// with zero spendable outputs were already handled above and stay quiet.
-	minForOneTx := s.cfg.MinBalanceForOneTx(seqInfo.Fee, s.minStorageDeposit)
+	fee := maxFee(seqs)
+	minForOneTx := s.cfg.MinBalanceForOneTx(fee, s.minStorageDeposit)
 	if availableBalance < minForOneTx {
 		if s.verbose {
 			s.log("UNDERFUNDED: spendable %d < minimum %d (transfer %d + fee %d + storage deposit %d) — fund this sender",
-				availableBalance, minForOneTx, s.cfg.Global.TransferAmount, seqInfo.Fee, s.minStorageDeposit)
+				availableBalance, minForOneTx, s.cfg.Global.TransferAmount, fee, s.minStorageDeposit)
 		}
-		return false
+		return false, 0
 	}
 
-	// Step 5: Build and submit batch
-	return s.buildAndSubmitBatch(available, pace, seqInfo, clnt)
+	// Step 5: Build and submit
+	if s.conflict {
+		return s.buildAndSubmitConflictSet(available, pace, seqs, clnt)
+	}
+	return s.buildAndSubmitBatch(available, pace, seqs[0], clnt), 0
+}
+
+// pickSequencers returns the sequencers to tag along with this round: one for a chained batch,
+// one per member of a conflict set.
+func (s *Sender) pickSequencers() []SequencerInfo {
+	if s.conflict {
+		return s.seqPicker.Distinct(s.setSize())
+	}
+	if seqInfo, ok := s.seqPicker.Next(); ok {
+		return []SequencerInfo{seqInfo}
+	}
+	return nil
+}
+
+// setSize is the requested number of transactions per conflict set: batch_size, a conflict set
+// being a batch spent as double-spends rather than as a chain, unless --fanout overrides it.
+// The picker caps it at the number of sequencers.
+func (s *Sender) setSize() int {
+	if s.conflictFanout > 0 {
+		return s.conflictFanout
+	}
+	return s.cfg.Global.BatchSize
+}
+
+func maxFee(seqs []SequencerInfo) (ret uint64) {
+	for _, sq := range seqs {
+		if sq.Fee > ret {
+			ret = sq.Fee
+		}
+	}
+	return
 }
 
 // classifyOutputs updates the spentSet based on current LRB state.
@@ -250,7 +304,8 @@ func (s *Sender) buildAndSubmitBatch(available []spendable, pace int, seqInfo Se
 			inputs = currentInputs
 		}
 
-		txBytes, txID, remainder, err := s.buildOneTx(inputs, pace, seqInfo, isLastInBatch)
+		ts := s.pickTimestamp(inputTimestamp(inputs), pace)
+		txBytes, txID, remainder, err := s.buildOneTx(inputs, ts, seqInfo, isLastInBatch)
 		if err != nil {
 			s.log("build tx error: %v", err)
 			s.metrics.TxFailed.Add(1)
@@ -302,11 +357,113 @@ func (s *Sender) buildAndSubmitBatch(available []spendable, pace int, seqInfo Se
 	return anySent
 }
 
+// buildAndSubmitConflictSet spends the batch as a set of double-spends rather than as a chain.
+// Every member consumes the same inputs — the same ones a batch would start from — and each
+// carries its own tag-along, to a different sequencer. Returns whether anything was submitted
+// and how many ledger ticks the set reserves on this holder's timeline.
+//
+// A node attaches an unsolicited non-sequencer transaction only if it carries an output for
+// its own sequencer, so each member lands in exactly one sequencer's backlog and every one of
+// them sees a tag-along it wants. Only one member can ever be consolidated, so the sequencers
+// holding the others have to revert their own state to converge with the winner. A sequencer
+// unwilling to revert stays on a lineage it cannot bring its peers onto, which is the
+// behaviour this mode exists to provoke.
+//
+// The members are spaced by the ledger's non-sequencer transaction pace. They share a holder
+// by construction — a UTXO is spendable only by its owner, and a transaction carries a single
+// signature — and a node drops a transaction whose timestamp falls within the pace of another
+// from the same holder. That check runs before the transaction is persisted or gossiped, so a
+// tighter set would collapse to one transaction and produce no conflict at all.
+//
+// A set of one reserves nothing and is exactly the batch of one.
+func (s *Sender) buildAndSubmitConflictSet(available []spendable, pace int, seqs []SequencerInfo, clnt *client.APIClient) (bool, int) {
+	tsSet := conflictTimestamps(s.pickTimestamp(inputTimestamp(available), pace), len(seqs), pace)
+
+	consumed := make([][]byte, len(available))
+	for i, in := range available {
+		consumed[i] = in.bytes
+	}
+
+	sent := 0
+	for i, seqInfo := range seqs {
+		txBytes, txID, _, err := s.buildOneTx(available, tsSet[i], seqInfo, true)
+		if err != nil {
+			s.log("conflict build error: %v", err)
+			s.metrics.TxFailed.Add(1)
+			break
+		}
+		if _, err = clnt.SubmitTransactionWithDetail(txBytes, client.WithConsumedUTXOs(consumed)); err != nil {
+			s.log("conflict submit error: %v", err)
+			s.metrics.TxFailed.Add(1)
+			s.rotateHost()
+			clnt = s.client()
+			// One unreachable host must not cost the whole set — carry on with the next member
+			// rather than abandoning the remaining sequencers.
+			if _, err = clnt.SubmitTransactionWithDetail(txBytes, client.WithConsumedUTXOs(consumed)); err != nil {
+				s.log("conflict submit retry error: %v", err)
+				continue
+			}
+		}
+		// Whichever member wins, the inputs are gone. Recording one spender is enough: if the
+		// whole set is lost, the finality timeout reclaims the outputs either way.
+		submittedSlot := txID.Timestamp().Slot
+		for _, in := range available {
+			s.spentSet[in.id] = spentEntry{TxID: txID, SubmittedSlot: submittedSlot}
+		}
+		s.metrics.TxSent.Add(1)
+		sent++
+		s.nextHost()
+		clnt = s.client()
+	}
+	if sent == 0 {
+		return false, 0
+	}
+	s.metrics.ConflictSets.Add(1)
+	if len(tsSet) == 1 {
+		return true, 0
+	}
+
+	// Wait out the stretch of this holder's timeline the set occupies, plus one pace, so the
+	// next set cannot land inside any member's pace window.
+	now := s.constants.LedgerTimeFromClockTime(time.Now())
+	return true, int(base.DiffTicks(tsSet[len(tsSet)-1], now)) + pace
+}
+
+// conflictTimestamps spaces the members of a conflict set exactly one transaction pace apart,
+// which is the tightest spacing a node will accept from a single holder.
+func conflictTimestamps(first base.LedgerTime, n, pace int) []base.LedgerTime {
+	ret := make([]base.LedgerTime, n)
+	for i := range ret {
+		ret[i] = first.AddTicks(i * pace)
+	}
+	return ret
+}
+
 // maxFutureJitterTicks caps how far ahead of "now" a jittered timestamp may
 // land. The node delays a future-dated tx until the wall clock reaches its
 // ledger time (ledger time ≈ wall clock; it only rejects timestamps more than
 // ~6 slots ahead), so we keep jitter well inside that window.
 const maxFutureJitterTicks = 5 * base.TicksPerSlot
+
+// inputTimestamp is the latest timestamp among the consumed outputs — the point the
+// transaction pace is measured from.
+func inputTimestamp(inputs []spendable) base.LedgerTime {
+	ret := base.NilLedgerTime
+	for _, in := range inputs {
+		ret = base.MaximumTime(ret, in.id.Timestamp())
+	}
+	return ret
+}
+
+// paceLowerBound is the earliest timestamp a new transaction may carry: a pace after the
+// latest input, and never behind the clock.
+func (s *Sender) paceLowerBound(inTs base.LedgerTime, pace int) base.LedgerTime {
+	lower := inTs.AddTicks(pace)
+	if now := s.constants.LedgerTimeFromClockTime(time.Now()); lower.Before(now) {
+		lower = now
+	}
+	return lower
+}
 
 // pickTimestamp chooses the timestamp for a new transaction. The lower bound is
 // max(maxInputTs + pace, now): it satisfies the non-sequencer pace invariant and
@@ -318,11 +475,8 @@ const maxFutureJitterTicks = 5 * base.TicksPerSlot
 // delays a future-dated tx until the clock catches up, so the jitter is safe;
 // it is clamped to stay within the node's future-acceptance window.
 func (s *Sender) pickTimestamp(inTs base.LedgerTime, pace int) base.LedgerTime {
-	lower := inTs.AddTicks(pace)
+	lower := s.paceLowerBound(inTs, pace)
 	now := s.constants.LedgerTimeFromClockTime(time.Now())
-	if lower.Before(now) {
-		lower = now
-	}
 	jitter := s.cfg.JitterTicks()
 	if jitter <= 0 {
 		return lower
@@ -342,16 +496,11 @@ func (s *Sender) pickTimestamp(inTs base.LedgerTime, pace int) base.LedgerTime {
 // singleton: produced outputs are composed via txbuildercore helpers and
 // the txID is derived from the signed bytes.
 // Returns txBytes, txID, remainder output (for chaining), or error.
-func (s *Sender) buildOneTx(inputs []spendable, pace int, seqInfo SequencerInfo, includeTagAlong bool) ([]byte, base.TransactionID, *spendable, error) {
-	// Aggregate input total and the maximum input timestamp.
+func (s *Sender) buildOneTx(inputs []spendable, ts base.LedgerTime, seqInfo SequencerInfo, includeTagAlong bool) ([]byte, base.TransactionID, *spendable, error) {
 	var inTotal uint64
-	inTs := base.NilLedgerTime
 	for _, in := range inputs {
 		inTotal += in.amount
-		inTs = base.MaximumTime(inTs, in.id.Timestamp())
 	}
-
-	ts := s.pickTimestamp(inTs, pace)
 
 	tagAlongFee := uint64(0)
 	if includeTagAlong {

@@ -28,6 +28,7 @@ func main() {
 		initFundCmd(),
 		initWithdrawCmd(),
 		initRunCmd(),
+		initConflictCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {

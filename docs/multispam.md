@@ -34,23 +34,27 @@ Exceptions are `tagAlong` and `stem` locks.
   - _pace constraints_ on transactions prevents building dense chains of transactions in the short window of the _ledger time_.
 _Pace constraints_ require certain number of ticks distance between consumed UTXO and consuming transaction. It is regulated by the
 ledger constants `constTransactionPaceSequencer` for sequencer transactions and `constTransactionPace` for non-sequencer transactions.
-  - policy enforced by the `txsenders` core module in the node. It rejects any transaction, that:
+  - per-holder policy enforced on the node's transaction input queue (`checkSenderPace`, absorbed
+from the former `txsenders` module). It rejects any transaction, that:
      - either has no UTXOs with its _holder ID_ in the ledger state of the _latest reliable branch_
      - or node has already seen a transaction with the same _holder ID_ closer in terms of the timestamp to the one just received, than the required pace.
 
 ## Architecture
 
 ### Commands
-All multispam commands live under `proxi multispam ...`:
+All multispam commands live under `multispam ...`:
 
-- `proxi multispam run` — run multi-spammer with K senders
-- `proxi multispam fund` — fund all (or selected) accounts from wallet
-- `proxi multispam withdraw` — sweep all (or selected) sender balances back into the wallet
-- `proxi multispam info` — display account balances and status
-- `proxi multispam init` - generates N keys, creates `multispam.yaml` config file with default values 
+- `multispam run` — run multi-spammer with K senders
+- `multispam conflict` — spam sets of conflicting transactions instead of throughput
+- `multispam fund` — fund all (or selected) accounts from wallet
+- `multispam withdraw` — sweep all (or selected) sender balances back into the wallet
+- `multispam info` — display account balances and status
+- `multispam init` - generates N keys, creates `multispam.yaml` config file with default values 
 
 ### Code location
-Package `multispam/` in the Proxima repo. Registered as a top-level `proxi multispam` command group (alongside `proxi node`, `proxi wallet`, etc.).
+Own repository `proxima-multispam`, built as the standalone `multispam` binary. It depends on a
+working tree of `proxima` as a sibling directory (`replace` in `go.mod`) and uses the same
+singleton-free wallet stack as `proxi` (`txbuildercore` + `glb.GetTxLibrary()`).
 
 ### Configuration
 File `multispam.yaml` in working directory.
@@ -82,7 +86,9 @@ senders:
 - `transfer_amount` — tokens to send per transaction. Must be >= storage deposit for target output.
   Self-transfer always occurs via the remainder output.
 - `finality_timeout_slots` — how many slots a pending tx can stay unfinalized before its inputs are reclaimed.
-- `batch_size` — transactions per batch (chained within pace constraints). Default 1.
+- `batch_size` — transactions per batch (chained within pace constraints). Default 1. Under
+  `multispam conflict` it is the size of the conflict set instead, capped at the number of
+  sequencers.
 - `target_strategy` — where to send the `transfer_amount`:
   - `"self"` — send to own address (two outputs: transfer + remainder, both to self)
   - `"next"` — send to next sender in circular order (1→2→...→K→1)
@@ -155,12 +161,12 @@ Global (shared across senders), refreshed once per slot:
 4. `NextSequencer()` returns next sequencer round-robin (or random)
 5. At least 1 sequencer is assumed. If not, exit 
 
-## Fund Command (`proxi multispam fund`)
+## Fund Command (`multispam fund`)
 
 Reads `multispam.yaml` and the standard `proxi.yaml` wallet config.
 
 ```
-proxi multispam fund --amount <tokens> [--sender <name>] [--config multispam.yaml]
+multispam fund --amount <tokens> [--sender <name>] [--config multispam.yaml]
 ```
 
 1. Load wallet private key from `proxi.yaml` (funding source)
@@ -172,14 +178,14 @@ proxi multispam fund --amount <tokens> [--sender <name>] [--config multispam.yam
    - Use remainder from previous tx as input for next (chain funding txs)
 4. Display final balances
 
-## Withdraw Command (`proxi multispam withdraw`)
+## Withdraw Command (`multispam withdraw`)
 
 The reverse of `fund`: instead of the wallet paying out to senders, each sender
 pays its whole balance back to the wallet. Reads `multispam.yaml` and the
 standard `proxi.yaml` wallet config (the wallet is the sweep target).
 
 ```
-proxi multispam withdraw [--senders <name>,...] [--config multispam.yaml]
+multispam withdraw [--senders <name>,...] [--config multispam.yaml]
 ```
 
 1. Load the wallet holder ID from `proxi.yaml` (the sweep destination)
@@ -200,28 +206,92 @@ Notes:
 - A single tx caps at 256 elements; withdraw produces two outputs, so it consumes
   at most 254 UTXOs per sender. A sender holding more keeps a small remainder that
   a second `withdraw` run sweeps.
-- Because it does not wait for inclusion, run `proxi multispam info` after finality
+- Because it does not wait for inclusion, run `multispam info` after finality
   to confirm every swept sender reached a zero balance.
 
-## Info Command (`proxi multispam info`)
+## Info Command (`multispam info`)
 
 ```
-proxi multispam info [--config multispam.yaml]
+multispam info [--config multispam.yaml]
 ```
 
 For each sender in config:
 - Query LRB outputs and balance
 - Display: name, holder ID, output count, total balance
 
-## Run Command (`proxi multispam run`)
+## Run Command (`multispam run`)
 
 ```
-proxi multispam run [--senders K] [--max-duration 10m] [--max-transactions 1000] [--config multispam.yaml]
+multispam run [--senders K] [--max-duration 10m] [--max-transactions 1000] [--config multispam.yaml]
 ```
 
 - `--senders K` — use first K senders from config (default: all)
 - `--max-duration` — stop after duration (optional)
 - `--max-transactions` — stop after total tx count (optional)
+
+## Conflict Command (`multispam conflict`)
+
+```
+multispam conflict [--senders K] [--fanout N] [--max-duration 10m] [--max-transactions 1000]
+```
+
+- `--fanout N` — transactions per conflict set (default: one per known sequencer)
+- other flags as for `run`
+
+A different load shape, aimed at the sequencer's skeleton search rather than at throughput.
+Where `run` chains transactions so they settle, `conflict` produces transactions that cannot
+all settle, and observes what the sequencers do about it.
+
+Everything is as in `run` — same rounds, same output selection, same `batch_size` — except how
+the batch is spent:
+
+| | `run` | `conflict` |
+|---|---|---|
+| the batch's transactions | chained: each consumes the previous remainder | a conflict set: all consume the same inputs |
+| tag-along | one, on the last transaction of the chain | one per member, each to a different sequencer |
+| settles | all of them | exactly one |
+
+Set size is `batch_size`, overridable with `--fanout`, and **capped at the number of
+sequencers**: it is the tag-along target that distinguishes members of the set from one
+another, so two members aimed at the same sequencer would land in the same backlog, where one
+simply loses and no second sequencer is left holding a conflicting transaction.
+
+At `batch_size: 1` the two modes are the same single transaction.
+
+Why the set produces the intended effect:
+
+- A node attaches an unsolicited non-sequencer transaction only if it carries an output for
+  its own sequencer (`shouldAttachNonSeq`); access nodes drop them all. So each member of the
+  set lands in exactly one sequencer's backlog, and every sequencer sees a tag-along it wants.
+- The members conflict, so at most one can be in any past cone. Once one sequencer has
+  consolidated its member, no sequencer holding another member can endorse it without first
+  reverting its own state. Refusing to revert is what leaves sequencers in groups that do not
+  cross-endorse.
+- Conflicting transactions necessarily share a holder: a UTXO is spendable only by its owner
+  and a Proxima transaction carries a single signature. So conflicts are always within one
+  sender, never between senders — the number of senders scales the rate, not the width of a
+  conflict.
+
+### Pace
+
+The set is spaced by the ledger's non-sequencer `TransactionPace`. A node remembers the last
+few timestamps per holder and drops a transaction landing within a pace of any of them. That
+check runs **before** the transaction is persisted or gossiped, so a tighter set does not reach
+any memDAG at all — it degrades into a single transaction and the tool silently stops testing
+anything. `conflictTimestamps` spaces members exactly one pace apart, and a round waits until
+one pace past its last member before starting the next set.
+`internal/multispam/conflict_test.go` replays the node's filter over the generated spacing to
+keep this from regressing.
+
+The pace also bounds the rate: a sender emits at most one transaction per pace, so a set of N
+occupies N paces and the round waits that out before starting the next set. With the default
+12-tick pace (~0.96 s) a sender produces roughly one conflict set per 5 s at set size 5. Scale
+by adding senders, not by tightening the spacing.
+
+### Funding
+
+Only one member of a set ever settles, so a set costs one tag-along fee however wide it is —
+funding is the same as for `run` at the same `batch_size`.
 
 ## Display
 
@@ -239,16 +309,16 @@ Periodic terminal output (once per slot or every few seconds):
 - `multispam/config.go` — parse `multispam.yaml`, validate, derive ledger constants
 - Register `proxi multispam` command group in `proxi/`
 
-### Step 2: `proxi multispam init`
+### Step 2: `multispam init`
 - Generate N ED25519 key pairs, save as `.key` files in `keys/` subdirectory
 - Generate `multispam.yaml` with default values and sender entries referencing the key files
 - Parameters: `--senders N` (number of keys to generate)
 
-### Step 3: `proxi multispam info`
+### Step 3: `multispam info`
 - Load config, load keys, query balances per sender
 - Simple display — useful for testing config and connectivity
 
-### Step 4: `proxi multispam fund`
+### Step 4: `multispam fund`
 - Transfer from wallet to each sender account
 - Chain transactions (each consumes remainder of previous)
 - Track inclusion before proceeding to next
@@ -262,7 +332,7 @@ Periodic terminal output (once per slot or every few seconds):
 - UTXO tracking, spent set management, transaction building
 - Host rotation on API errors
 
-### Step 7: Coordinator and `proxi multispam run`
+### Step 7: Coordinator and `multispam run`
 - `multispam/coordinator.go` — start K senders, collect metrics, display
 - Graceful shutdown on Ctrl+C (context cancellation)
 - Periodic TPS computation and display

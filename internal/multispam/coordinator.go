@@ -22,6 +22,7 @@ type Coordinator struct {
 
 	maxDuration     time.Duration
 	maxTransactions int64
+	conflict        bool
 }
 
 type CoordinatorParams struct {
@@ -33,6 +34,11 @@ type CoordinatorParams struct {
 	MaxTransactions int64
 	Verbose         bool
 	LogFunc         func(format string, args ...any)
+
+	// Conflict makes every sender spam sets of conflicting transactions instead of chained
+	// batches; ConflictFanout is the size of a set, 0 meaning one per known sequencer.
+	Conflict       bool
+	ConflictFanout int
 }
 
 func NewCoordinator(par CoordinatorParams) (*Coordinator, error) {
@@ -90,6 +96,8 @@ func NewCoordinator(par CoordinatorParams) (*Coordinator, error) {
 			Verbose:    par.Verbose,
 
 			MinStorageDeposit: minStorageDeposit,
+			Conflict:          par.Conflict,
+			ConflictFanout:    par.ConflictFanout,
 		})
 	}
 
@@ -101,6 +109,7 @@ func NewCoordinator(par CoordinatorParams) (*Coordinator, error) {
 		logFunc:         par.LogFunc,
 		maxDuration:     par.MaxDuration,
 		maxTransactions: par.MaxTransactions,
+		conflict:        par.Conflict,
 	}, nil
 }
 
@@ -114,6 +123,11 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}
 	if c.seqReg.Count() == 0 {
 		return fmt.Errorf("no active sequencers found")
+	}
+	// A conflict set aims each of its members at a different sequencer, so a single sequencer
+	// caps every set at one transaction and nothing conflicts.
+	if c.conflict && c.seqReg.Count() < 2 {
+		return fmt.Errorf("conflict mode needs at least 2 sequencers, found %d", c.seqReg.Count())
 	}
 	c.log("discovered %d sequencer(s)", c.seqReg.Count())
 
@@ -130,7 +144,11 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	for _, sender := range c.senders {
 		go sender.Run(ctx)
 	}
-	c.log("started %d sender(s), strategy: %s", len(c.senders), c.cfg.Global.TargetStrategy)
+	mode := "batch"
+	if c.conflict {
+		mode = "conflict"
+	}
+	c.log("started %d sender(s), mode: %s, strategy: %s", len(c.senders), mode, c.cfg.Global.TargetStrategy)
 
 	// Display + sequencer refresh loop
 	slotDuration := c.constants.SlotDuration()
@@ -173,8 +191,12 @@ func (c *Coordinator) Run(ctx context.Context) error {
 				)
 			}
 
-			fmt.Printf("\r\033[K[%.0fs] TPS: %.1f | sent: %d (+%d) | failed: %d\n%s\n",
-				elapsed, tps, totalSent, slotTxs, totalFailed, senderStats.String())
+			conflictStats := ""
+			if c.conflict {
+				conflictStats = fmt.Sprintf(" | sets: %d", c.totalConflictSets())
+			}
+			fmt.Printf("\r\033[K[%.0fs] TPS: %.1f | sent: %d (+%d) | failed: %d%s\n%s\n",
+				elapsed, tps, totalSent, slotTxs, totalFailed, conflictStats, senderStats.String())
 
 			prevTotalSent = totalSent
 		}
@@ -185,6 +207,14 @@ func (c *Coordinator) totalSent() int64 {
 	var total int64
 	for _, s := range c.senders {
 		total += s.Metrics().TxSent.Load()
+	}
+	return total
+}
+
+func (c *Coordinator) totalConflictSets() int64 {
+	var total int64
+	for _, s := range c.senders {
+		total += s.Metrics().ConflictSets.Load()
 	}
 	return total
 }
@@ -206,6 +236,9 @@ func (c *Coordinator) printFinalStats(startTime time.Time) {
 	c.log("--- final stats ---")
 	c.log("duration: %.1fs, total sent: %d, failed: %d, avg TPS: %.1f",
 		elapsed, totalSent, totalFailed, tps)
+	if c.conflict {
+		c.log("conflict sets: %d (%.2f/s)", c.totalConflictSets(), float64(c.totalConflictSets())/elapsed)
+	}
 	for _, s := range c.senders {
 		m := s.Metrics()
 		c.log("  %s: sent=%d failed=%d balance=%s",

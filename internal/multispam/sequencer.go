@@ -103,6 +103,33 @@ func NewSequencerPicker(registry *SequencerRegistry, strategy string) *Sequencer
 	}
 }
 
+// Distinct returns min(n, known sequencers) different sequencers, walking on from this
+// picker's position so that different senders start on different ones.
+//
+// It is the tag-along target that distinguishes the members of a conflict set from one
+// another; two members sharing a sequencer land in the same backlog, where one simply loses
+// and no second sequencer is left holding a conflicting transaction. So the set is capped at
+// the number of sequencers rather than cycling through them.
+func (p *SequencerPicker) Distinct(n int) []SequencerInfo {
+	seqs := p.registry.snapshot()
+	if len(seqs) == 0 || n <= 0 {
+		return nil
+	}
+	if n > len(seqs) {
+		n = len(seqs)
+	}
+	start := p.nextIdx
+	if p.strategy == StrategyRandom {
+		start = rand.Intn(len(seqs))
+	}
+	ret := make([]SequencerInfo, n)
+	for i := 0; i < n; i++ {
+		ret[i] = seqs[(start+i)%len(seqs)]
+	}
+	p.nextIdx = (start % len(seqs)) + 1
+	return ret
+}
+
 // Next returns the next sequencer for this sender.
 // Returns false if no sequencers are known.
 func (p *SequencerPicker) Next() (SequencerInfo, bool) {
